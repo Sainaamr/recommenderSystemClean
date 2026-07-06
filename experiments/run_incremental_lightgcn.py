@@ -1,0 +1,684 @@
+
+"""
+Incremental LightGCN streaming experiment.
+
+Supports both ml-1m and yelp datasets via --dataset argument.
+
+Step 1: Train LightGCN on historical split (skip if checkpoint exists)
+Step 2: Stream realtime split in batches of 1000 interactions
+Step 3: Every 20 batches, run incremental_update() on accumulated interactions
+Step 4: Compare two strategies:
+          - no_update:    model never updates → quality degrades over time
+          - incremental:  model updates every 20 batches → quality stays stable
+Step 5: Save Recall@10 and energy per batch to results/{dataset}_hybrid_results.csv
+Step 6: Plot quality degradation vs recovery curve
+
+Usage:
+  python experiments/run_incremental_lightgcn.py --dataset ml-1m
+  python experiments/run_incremental_lightgcn.py --dataset yelp
+
+Outputs (timestamped to avoid overwriting previous runs):
+  results/ml1m_hybrid_results_YYYYMMDD_HHMMSS.csv
+  results/ml1m_hybrid_curves_YYYYMMDD_HHMMSS.png
+"""
+
+import os, sys, glob, argparse, json
+from pathlib import Path
+from datetime import datetime
+
+ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import torch
+from codecarbon import EmissionsTracker
+
+from recbole.quick_start import run_recbole
+from recbole.config import Config
+from recbole.data import create_dataset
+
+from src.models.incremental_lightgcn import IncrementalLightGCN
+from src.evaluation.metrics import batch_metrics_lgcn
+from tools.plot_utils import plot_streaming_results
+
+# ── Parameters ───────────────────────────────────────────────────────────────
+BATCH_SIZE    = 1000
+UPDATE_EVERY  = 20    # run incremental_update every N batches
+UPDATE_EPOCHS = 30    # gradient steps per incremental update
+TOP_K         = 10
+RESULTS_DIR   = Path("results")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Dataset configs ───────────────────────────────────────────────────────────
+# Each dataset has different paths, config files, ID types, and output files.
+# ml-1m uses numeric IDs (cast with int), Yelp uses alphanumeric (keep as str).
+DATASET_CONFIGS = {
+    "ml-1m": {
+        "dataset":          "ml-1m-historical",
+        "historical_path":  "dataset/ml-1m-historical/ml-1m-historical.inter",
+        "realtime_path":    "dataset/ml-1m-realtime/ml-1m-realtime.inter",
+        "config_files":     ["configs/dataset.yaml", "configs/historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":           "saved/compatible/LightGCN-ml1m-historical.pth",
+        "itemknn_checkpoint":   "saved/compatible/ItemKNN-ml1m-historical.pkl",
+        "results_csv":          RESULTS_DIR / "ml1m_hybrid_results.csv",
+        "results_png":          RESULTS_DIR / "ml1m_hybrid_curves.png",
+        "id_cast":              lambda x: str(int(x)),
+        "plot_title":           "Incremental LightGCN vs No Update\n(ml-1m streaming, batch size=1000)",
+    },
+    "yelp": {
+        "dataset":              "yelp-historical",
+        "historical_path":      "dataset/yelp-historical/yelp-historical.inter",
+        "realtime_path":        "dataset/yelp-realtime/yelp-realtime.inter",
+        "config_files":         ["configs/yelp_dataset.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":           "saved/compatible/LightGCN-yelp-historical.pth",
+        "itemknn_checkpoint":   "saved/compatible/ItemKNN-yelp-historical.pkl",
+        "results_csv":          RESULTS_DIR / "yelp_hybrid_results.csv",
+        "results_png":          RESULTS_DIR / "yelp_hybrid_curves.png",
+        "id_cast":              lambda x: str(x),
+        "plot_title":           "Incremental LightGCN vs No Update\n(yelp streaming, batch size=1000)",
+    },
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Step 1: Train on historical data (doubled check)
+
+def train_historical(cfg: dict) -> tuple[str, float]:
+    """
+    Train LightGCN on historical dataset. Returns (checkpoint_path, training_energy_uwh).
+
+    Training energy is measured with codecarbon and saved to a sidecar
+    "<checkpoint>.energy.json" file next to the checkpoint, so the one-time
+    training cost survives across runs that later reuse the checkpoint
+    (in that case training_energy_uwh is read back from the sidecar, or 0.0
+    if no sidecar exists — e.g. a checkpoint trained before this was added).
+    """
+    # If a specific checkpoint is configured, use it directly
+    if cfg["checkpoint"] and Path(cfg["checkpoint"]).exists():
+        print(f"Found existing checkpoint: {cfg['checkpoint']}")
+        energy_file = Path(cfg["checkpoint"]).with_suffix(".energy.json")
+        if energy_file.exists():
+            training_energy_uwh = json.loads(energy_file.read_text())["training_energy_uwh"]
+        else:
+            print("  (no energy sidecar found — historical training energy unknown for this checkpoint)")
+            training_energy_uwh = 0.0
+        return cfg["checkpoint"], training_energy_uwh
+
+    print(f"Training LightGCN on {cfg['dataset']}...")
+    tracker = EmissionsTracker(
+        project_name=f"historical_training_{cfg['dataset']}",
+        output_dir=str(RESULTS_DIR),
+        log_level="error",
+        save_to_file=False,
+    )
+    tracker.start()
+    run_recbole(
+        model="LightGCN",
+        dataset=cfg["dataset"],
+        config_file_list=cfg["config_files"],
+    )
+    kwh = tracker.stop() or 0.0
+    training_energy_uwh = kwh * 1e6
+    print(f"  Historical training energy: {training_energy_uwh:.4f} µWh")
+
+    checkpoints = sorted(glob.glob("saved/LightGCN-*.pth"))
+    assert checkpoints, "No LightGCN checkpoint found after training"
+    checkpoint_path = checkpoints[-1]
+
+    energy_file = Path(checkpoint_path).with_suffix(".energy.json")
+    energy_file.write_text(json.dumps({"training_energy_uwh": training_energy_uwh}))
+
+    return checkpoint_path, training_energy_uwh
+
+
+# Step 2: Load model and ID mappings
+
+def load_id_mappings(cfg: dict):
+    """
+    Build the RecBole config/dataset and token→internal_id mappings.
+    Returns (user2id, item2id, config, dataset) — config/dataset are handed
+    to IncrementalLightGCN.from_checkpoint by the caller to build the model.
+    """
+    config = Config(
+        model="LightGCN",
+        dataset=cfg["dataset"],
+        config_file_list=cfg["config_files"],
+    )
+    dataset = create_dataset(config)
+    # RecBole token arrays: index = internal ID, value = original token string
+    # user_tokens: user_tokens[57] gives the real user ID. 57 is the row number assigned
+    user_tokens = dataset.field2id_token["user_id"]
+    item_tokens = dataset.field2id_token["item_id"]
+
+    # Reverse the Array and turn it into dict
+    # user2id: lets say 4231 is the user id  user2id["4231"] gives 57 which is row
+    user2id = {str(tok): idx for idx, tok in enumerate(user_tokens)}
+    item2id = {str(tok): idx for idx, tok in enumerate(item_tokens)}
+    print(f"  Users in dataset: {dataset.user_num}")
+    print(f"  Items in dataset: {dataset.item_num}")
+    return user2id, item2id, config, dataset
+
+
+#  Step 3: Build historical user profiles
+
+def build_user_history(user2id: dict, item2id: dict, cfg: dict) -> dict:
+    """
+    Build user_internal_id (row number) → set of item_internal_ids (row numbers), from historical data.
+    Only keeps users and items that exist in the trained model.
+    """
+    df = pd.read_csv(cfg["historical_path"], sep="\t")
+
+    # keep only <= 3 rated items with the assumption it is liked
+    df = df[df["rating:float"] >= 3]
+
+    # turn id raw id into string because mapping table built by load id mappings
+    # is based on string
+    id_cast = cfg["id_cast"]
+
+    #  build history row to row and not id to id
+    history = {}
+    for _, row in df.iterrows():
+        uid = user2id.get(id_cast(row["user_id:token"]))
+        iid = item2id.get(id_cast(row["item_id:token"]))
+        if uid is None or iid is None:
+            continue
+        if uid not in history:
+            history[uid] = set()
+        history[uid].add(iid)
+
+    print(f"  Historical profiles built for {len(history)} users")
+    return history
+
+
+#  Recall@K computation 
+#
+#   Batch 20 — NO UPDATE:
+#
+#   Model embeddings: unchanged from historical training.
+#
+#   Model's top-10 scores (before masking):
+#   italian_1 → 0.95  ← already visited, MASKED to -inf
+#   italian_2 → 0.90  ← already visited, MASKED to -inf
+#   italian_3 → 0.85
+#   italian_4 → 0.80
+#   sushi_2   → 0.75
+#   italian_5 → 0.70
+#   burger_1  → 0.65
+#   pizza_1   → 0.60
+#   pizza_2   → 0.55
+#   pizza_3   → 0.50
+#   pizza_4   → 0.45
+#
+#   After masking, top-10:
+#   {italian_3, italian_4, sushi_2, italian_5, burger_1, pizza_1, pizza_2, pizza_3, pizza_4, italian_6}
+#
+#   Ground truth (batch 20): {sushi_2, sushi_9}
+#
+#   Hits: {sushi_2} → 1 hit
+#
+#   Recall@10 = 1/2 = 0.5
+#
+#   Model never updates → embeddings stay the same forever.
+#
+#   ---
+#   Batch 40 — NO UPDATE:
+#
+#   Model embeddings: still unchanged from historical training.
+#
+#   Model's top-10 scores (before masking):
+#   italian_1 → 0.95  ← already visited, MASKED to -inf
+#   italian_2 → 0.90  ← already visited, MASKED to -inf
+#   italian_3 → 0.85
+#   italian_4 → 0.80
+#   sushi_2   → 0.75  ← now also visited (from batch 20), MASKED to -inf
+#   italian_5 → 0.70
+#   burger_1  → 0.65
+#   pizza_1   → 0.60
+#   pizza_2   → 0.55
+#   pizza_3   → 0.50
+#   pizza_4   → 0.45
+#   italian_6 → 0.40
+#
+#   After masking, top-10:
+#   {italian_3, italian_4, italian_5, burger_1, pizza_1, pizza_2, pizza_3, pizza_4, italian_6, italian_7}
+#
+#   Ground truth (batch 40): {sushi_5, sushi_9} ← user has shifted to sushi
+#
+#   Hits: {} → 0 hits
+#
+#   Recall@10 = 0/2 = 0.0
+#
+#   The scores didn't change at all — but the ground truth did because the user's
+#   real behaviour shifted. The model keeps recommending Italian while the user now wants sushi.
+#
+#   ---
+#   Batch 20 — INCREMENTAL:
+#
+#   Same as no_update at this point — recall measured before update:
+#   Recall@10 = 1/2 = 0.5
+#
+#   Then update triggers → model sees 20,000 recent interactions, lots of sushi visits → embeddings shift toward sushi.
+#
+#   ---
+#   Batch 40 — INCREMENTAL:
+#
+#   Model embeddings: updated — now leans toward sushi.
+#
+#   Model's top-10 scores (before masking):
+#   italian_1 → 0.95  ← already visited, MASKED to -inf
+#   italian_2 → 0.90  ← already visited, MASKED to -inf
+#   sushi_2   → 0.88  ← already visited (from batch 20), MASKED to -inf
+#   sushi_5   → 0.85  ← score went up after update
+#   sushi_9   → 0.82  ← score went up after update
+#   italian_3 → 0.75
+#   sushi_3   → 0.70
+#   burger_1  → 0.60
+#   pizza_1   → 0.55
+#   pizza_2   → 0.50
+#   pizza_3   → 0.45
+#
+#   After masking, top-10:
+#   {sushi_5, sushi_9, italian_3, sushi_3, burger_1, pizza_1, pizza_2, pizza_3, italian_4, italian_5}
+#
+#   Ground truth (batch 40): {sushi_5, sushi_9}
+#
+#   Hits: {sushi_5, sushi_9} → 2 hits
+#   Recall@10 = 2/2 = 1.0
+#
+def recall_at_k(model: IncrementalLightGCN, user_ids: list, item_ids: list,
+                user_history: dict, k: int = TOP_K) -> float:
+    """
+    For each user in user_ids, recommend top-K items (excluding seen history),
+    then compute Recall@K against item_ids (ground truth for this batch).
+    Returns average Recall@K across users.
+    """
+    model.eval()
+    # don't save gradients not needed
+    with torch.no_grad():
+        user_all_emb, item_all_emb = model.forward()
+
+    # Group ground truth items by user
+    # user_gt = {1: {10, 30}, 2: {20}, 3: {40}}
+    user_gt = {}
+    for uid, iid in zip(user_ids, item_ids):
+        if uid not in user_gt:
+            user_gt[uid] = set()
+        user_gt[uid].add(iid)
+
+    recalls = []
+
+    for uid, gt_items in user_gt.items():
+
+        # Safeguard in case the user id is bigger than total number of users
+        if uid >= user_all_emb.shape[0]:
+            continue
+
+        # multiply one user's embedding with all item embeddings → how much this user likes each item
+        scores = torch.matmul(user_all_emb[uid], item_all_emb.T).cpu().numpy()
+
+        # Mask already-seen items so they can never appear in recommendations
+        # scores     = [0.9, 0.3, 0.8, 0.95, 0.1]
+        # seen       = {0, 2}  ← user already saw items 0 and 2
+        # after mask = [-inf, 0.3, -inf, 0.95, 0.1]
+        seen = user_history.get(uid, set())
+        if seen:
+            scores[list(seen)] = -np.inf
+
+        # top_k    = {1, 3}    ← model recommended these
+        # gt_items = {3, 7}    ← user actually liked these in this batch
+        # hits     = 1         ← only item 3 was correctly recommended
+        top_k = set(np.argpartition(scores, -k)[-k:])
+        hits = len(top_k & gt_items)
+        recalls.append(hits / max(len(gt_items), 1))
+
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+#Step 5: Main streaming loop
+
+"""""
+- model — the IncrementalLightGCN instance, already loaded from a checkpoint before this function was called. Holds the actual embedding tables and does the scoring/training.
+- user2id — a dictionary mapping real-world user IDs (strings, e.g. "4231") to their row number in the model's embedding table. Built once by load_id_mappings, passed in here, and (for no_update/incremental) grows in place as new users appear in the stream.
+- item2id — same idea as user2id, but for items.
+- user_history — a dictionary of {uid: {set of item ids this user already interacted with}}, built from the historical data before streaming starts (via build_user_history)
+- strategy — a plain string, one of "no_update", "incremental", "full_retrain" — controls which branch of the function runs.
+- cfg — the settings dictionary for whichever dataset is running (paths, id_cast, batch_size, etc.) — explained in detail a few messages back.
+"""
+def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
+                  user_history: dict, strategy: str, cfg: dict) -> pd.DataFrame:
+    """
+    Stream realtime data in batches of BATCH_SIZE.
+    strategy: 'no_update', 'incremental', or 'full_retrain'
+
+    New users and items that appear in the stream but were not in historical
+    training are assigned fresh internal IDs and added to the model on the fly:
+      - incremental:  added to graph + embeddings trained via incremental_update
+      - no_update:    embeddings expanded with mean init (so they can be scored)
+                      but graph and weights never updated
+      - full_retrain: every update_every batches, retrains LightGCN from
+                      scratch (not warm-started) via RecBole (run_recbole),
+                      on all historical + realtime interactions consumed so
+                      far — the recall/energy "ceiling" comparison point.
+                      Unlike the other two, IDs are looked up per-batch
+                      (not grown/precomputed upfront), because a RecBole
+                      retrain can renumber IDs — its user_inter_num_interval
+                      / item_inter_num_interval filters re-evaluate against
+                      the whole combined dataset each retrain, so which IDs
+                      even qualify can change. New users/items not yet
+                      incorporated by the most recent retrain are skipped
+                      from evaluation until the next retrain absorbs them.
+    """
+    print(f"\nRunning strategy: {strategy}")
+    # get info from config file
+    id_cast = cfg["id_cast"]
+    batch_size = cfg.get("batch_size", BATCH_SIZE)
+    update_every = cfg.get("update_every", UPDATE_EVERY)
+
+
+    records = [] # to keep track
+
+    # Deep copy history so strategies don't interfere with each other
+    history = {uid: set(items) for uid, items in user_history.items()}
+
+    if strategy == "full_retrain":
+        realtime_df    = pd.read_csv(cfg["realtime_path"], sep="\t")
+        historical_raw = pd.read_csv(cfg["historical_path"], sep="\t")
+
+        # filter rows for only rating of 3 star above
+        df = realtime_df[realtime_df["rating:float"] >= 3].copy()
+
+        # hold original index
+        # the different between this and iid / uid is that interactions of a user is not in one row rather
+        # is it distrubtuted all over the raw data so inex is jsut the index of the row
+        # of one user and one item interaction
+        # we need this because
+        df["orig_idx"] = df.index
+
+        #reset so the holes in index goe away
+        df = df.reset_index(drop=True)
+        n_batches = len(df) // batch_size
+
+        # create the file for the new combined dataset including the config file
+        # combined dataset will incude history  + realtime until that point
+        combined_name = f"{cfg['dataset']}-combined"
+        combined_dir = Path("dataset") / combined_name
+        combined_dir.mkdir(parents=True, exist_ok=True)
+        combined_path = combined_dir / f"{combined_name}.inter"
+        combined_cfg = {**cfg, "dataset": combined_name, "historical_path": str(combined_path)}
+        consumed_raw_upto = -1 # mark how far along in realtime data we are
+
+    else:
+        # same filter for other strategy
+        df = pd.read_csv(cfg["realtime_path"], sep="\t")
+        df = df[df["rating:float"] >= 3].reset_index(drop=True)
+
+        # Growing ID mappings — new users/items get assigned the next available ID
+        # instead of being dropped. user2id and item2id are mutated in place.
+        # this is different compare to the full retrain
+        next_user_id = [model.n_users]   # list so it's mutable inside lambda
+        next_item_id = [model.n_items]
+
+        # based on user id return the row number of the original one or give me row if new user
+        # each row represent a user
+        def get_or_create_uid(x):
+            key = id_cast(x)
+            if key not in user2id:
+                user2id[key] = next_user_id[0]
+                next_user_id[0] += 1
+            return user2id[key]
+
+        def get_or_create_iid(x):
+            key = id_cast(x)
+            if key not in item2id:
+                item2id[key] = next_item_id[0]
+                next_item_id[0] += 1
+            return item2id[key]
+
+        # new column with original row number
+        df["uid"] = df["user_id:token"].apply(get_or_create_uid)
+        df["iid"] = df["item_id:token"].apply(get_or_create_iid)
+        df["uid"] = df["uid"].astype(int)
+        df["iid"] = df["iid"].astype(int)
+
+        # Expand model embeddings upfront for all new entities seen in the stream.
+        # New rows are initialized with mean of existing embeddings.
+        # For incremental: add_interactions will also expand as new IDs arrive per batch.
+        # For no_update: this is not important since it is never actually used
+        max_uid = int(df["uid"].max()) + 1
+        max_iid = int(df["iid"].max()) + 1
+        if max_uid > model.n_users or max_iid > model.n_items:
+            model.expand_embeddings(max(max_uid, model.n_users), max(max_iid, model.n_items))
+
+        n_batches = len(df) // batch_size
+
+        # Buffer to accumulate new interactions since last update
+        buffer_users = []
+        buffer_items = []
+
+    for i in range(n_batches):
+        batch = df.iloc[i * batch_size: (i + 1) * batch_size]
+
+        if strategy == "full_retrain":
+            batch_users, batch_items = [], []
+            for _, row in batch.iterrows():
+                u  = user2id.get(id_cast(row["user_id:token"]))
+                it = item2id.get(id_cast(row["item_id:token"]))
+                if u is not None and it is not None and u < model.n_users and it < model.n_items:
+                    batch_users.append(u)
+                    batch_items.append(it)
+        else:
+            batch_users = batch["uid"].tolist()
+            batch_items = batch["iid"].tolist()
+
+        # Measure metrics before update (reflects current model state, no data leakage)
+        if batch_users:
+            m = batch_metrics_lgcn(model, batch_users, batch_items, history, k=TOP_K)
+        else:
+            m = {"recall@10": 0.0, "ndcg@10": 0.0, "hr@10": 0.0,
+                 "recall@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
+        recall = m["recall@10"]
+
+        update_energy_uwh = 0.0
+        updated = False
+
+        if strategy == "incremental":
+            # Accumulate interactions into buffer
+            buffer_users.extend(batch_users)
+            buffer_items.extend(batch_items)
+
+            if (i + 1) % update_every == 0:
+                # Use all accumulated interactions since last update (not just current batch)
+                # This gives a stronger gradient signal: 20 batches × 1000 = 20,000 interactions
+                new_users = np.array(buffer_users)
+                new_items = np.array(buffer_items)
+
+                tracker = EmissionsTracker(
+                    project_name=f"incremental_update_batch_{i}",
+                    output_dir=str(RESULTS_DIR),
+                    log_level="error",
+                    save_to_file=False,
+                )
+                tracker.start()
+                model.add_interactions(new_users, new_items)
+                model.incremental_update(new_users, new_items, n_epochs=UPDATE_EPOCHS)
+                kwh = tracker.stop() or 0.0
+                update_energy_uwh = kwh * 1e6
+                updated = True
+
+                # Clear buffer after update
+                buffer_users = []
+                buffer_items = []
+
+        elif strategy == "full_retrain":
+            consumed_raw_upto = max(consumed_raw_upto, int(batch["orig_idx"].max()))
+
+            if (i + 1) % update_every == 0:
+                #
+                consumed_realtime = realtime_df.iloc[: consumed_raw_upto + 1]
+                combined = pd.concat([historical_raw, consumed_realtime], ignore_index=True)
+                combined.to_csv(combined_path, sep="\t", index=False)
+
+                tracker = EmissionsTracker(
+                    project_name=f"full_retrain_batch_{i}",
+                    output_dir=str(RESULTS_DIR),
+                    log_level="error",
+                    save_to_file=False,
+                )
+                tracker.start()
+                run_recbole(model="LightGCN", dataset=combined_name, config_file_list=cfg["config_files"])
+                kwh = tracker.stop() or 0.0
+                update_energy_uwh = kwh * 1e6
+
+                checkpoints = sorted(glob.glob("saved/LightGCN-*.pth"))
+                assert checkpoints, "No LightGCN checkpoint found after full retrain"
+                raw_ckpt_path = checkpoints[-1]
+
+                # Move out of the generic saved/LightGCN-*.pth pool (shared
+                # with historical training) into a dedicated, clearly-labeled
+                # location — so full_retrain's periodic snapshots never get
+                # confused with the historical starting checkpoint, and stay
+                # organized per-dataset and per-batch instead of piling
+                retrain_dir = Path("saved/full_retrain") / cfg["dataset"]
+                retrain_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = retrain_dir / f"batch_{i + 1:04d}.pth"
+                Path(raw_ckpt_path).rename(ckpt_path)
+                ckpt_path = str(ckpt_path)
+
+                user2id, item2id, config, dataset = load_id_mappings(combined_cfg)
+                model = IncrementalLightGCN.from_checkpoint(ckpt_path, config, dataset)
+                history = build_user_history(user2id, item2id, combined_cfg)
+                updated = True
+
+        # Add batch to running history
+        for uid, iid in zip(batch_users, batch_items):
+            if uid not in history:
+                history[uid] = set()
+            history[uid].add(iid)
+
+        records.append({
+            "batch":             i + 1,
+            "interactions":      (i + 1) * BATCH_SIZE,
+            "strategy":          strategy,
+            "recall_at_10":      m["recall@10"],
+            "ndcg_at_10":        m["ndcg@10"],
+            "hr_at_10":          m["hr@10"],
+            "recall_at_20":      m["recall@20"],
+            "ndcg_at_20":        m["ndcg@20"],
+            "hr_at_20":          m["hr@20"],
+            "mrr":               m["mrr"],
+            "update_energy_uwh": update_energy_uwh,
+            "updated":           updated,
+        })
+
+        if (i + 1) % 20 == 0 or updated:
+            print(f"  Batch {i+1:>3}/{n_batches}  Recall@10={recall:.4f}"
+                  + (f"  ← updated ({update_energy_uwh:.4f} µWh)" if updated else ""))
+
+    return pd.DataFrame(records)
+
+
+# Step 6: Plot results
+
+def plot_results(df: pd.DataFrame, cfg: dict):
+    plot_streaming_results(df, cfg["results_png"], cfg["plot_title"], UPDATE_EVERY)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=["ml-1m", "yelp"], required=True,
+                        help="Dataset to run the experiment on")
+    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
+                        help="Directory to save results (default: results/)")
+    parser.add_argument("--full-retrain", action="store_true",
+                        help="Also run the full-retrain baseline (expensive — "
+                             "retrains LightGCN from scratch every update_every batches)")
+    args = parser.parse_args()
+
+    results_dir = args.results_dir
+    cfg = DATASET_CONFIGS[args.dataset].copy()
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stamp output filenames with timestamp so runs never overwrite each other
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset_prefix = args.dataset.replace("-", "")
+    cfg["results_csv"] = results_dir / f"{dataset_prefix}_hybrid_results_{ts}.csv"
+    cfg["results_png"] = results_dir / f"{dataset_prefix}_hybrid_curves_{ts}.png"
+    print(f"Run timestamp: {ts}")
+
+    # Step 1: Train or load checkpoint
+    checkpoint, training_energy_uwh = train_historical(cfg)
+
+    # Step 2: Load model and ID mappings
+    print("\nLoading model and building ID mappings...")
+    user2id, item2id, config, dataset = load_id_mappings(cfg)
+    model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
+
+    # Step 3: Build historical profiles
+    print("Building user history from historical data...")
+    user_history = build_user_history(user2id, item2id, cfg)
+
+    # Step 4: No-update strategy
+    df_no_update = run_streaming(model, user2id, item2id, user_history, strategy="no_update", cfg=cfg)
+
+    # Reload clean model for incremental strategy (so strategies start from same weights)
+    print("\nReloading model for incremental strategy...")
+    user2id, item2id, config, dataset = load_id_mappings(cfg)
+    model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
+    user_history = build_user_history(user2id, item2id, cfg)
+
+    # Step 5: Incremental strategy
+    df_incremental = run_streaming(model, user2id, item2id, user_history, strategy="incremental", cfg=cfg)
+
+    all_dfs = [df_no_update, df_incremental]
+
+    # Step 5b: Full-retrain baseline (opt-in — expensive)
+    df_full_retrain = None
+    if args.full_retrain:
+        print("\nReloading model for full_retrain strategy...")
+        user2id, item2id, config, dataset = load_id_mappings(cfg)
+        model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
+        user_history = build_user_history(user2id, item2id, cfg)
+        df_full_retrain = run_streaming(model, user2id, item2id, user_history, strategy="full_retrain", cfg=cfg)
+        all_dfs.append(df_full_retrain)
+
+    # Step 6: Save and plot
+    results = pd.concat(all_dfs, ignore_index=True)
+    results.to_csv(cfg["results_csv"], index=False)
+    print(f"\nResults saved → {cfg['results_csv']}")
+
+    plot_results(results, cfg)
+
+    # Summary
+    avg_no_update   = df_no_update["recall_at_10"].mean()
+    avg_incremental = df_incremental["recall_at_10"].mean()
+    total_energy    = df_incremental["update_energy_uwh"].sum()
+    n_updates       = int(df_incremental["updated"].sum())
+
+    print("\n── Summary ──────────────────────────────────────────────")
+    print(f"  Avg Recall@10 (no update):   {avg_no_update:.4f}")
+    print(f"  Avg Recall@10 (incremental): {avg_incremental:.4f}")
+    print(f"  Historical training energy:  {training_energy_uwh:.4f} µWh")
+    print(f"  Total incremental update energy: {total_energy:.4f} µWh")
+    print(f"  Number of updates:           {n_updates}")
+    print(f"  Avg energy per update:       {total_energy / max(n_updates, 1):.4f} µWh")
+
+    if df_full_retrain is not None:
+        avg_full_retrain   = df_full_retrain["recall_at_10"].mean()
+        total_retrain_energy = df_full_retrain["update_energy_uwh"].sum()
+        n_retrains          = int(df_full_retrain["updated"].sum())
+        print(f"  Avg Recall@10 (full retrain): {avg_full_retrain:.4f}")
+        print(f"  Total full-retrain energy:    {total_retrain_energy:.4f} µWh")
+        print(f"  Number of retrains:           {n_retrains}")
+        print(f"  Avg energy per retrain:       {total_retrain_energy / max(n_retrains, 1):.4f} µWh")
+
+
+if __name__ == "__main__":
+    main()

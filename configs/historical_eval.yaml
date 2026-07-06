@@ -1,0 +1,11 @@
+# Evaluation config for historical training only.
+# Real test set is ml-1m-realtime — no test split needed here.
+eval_args:
+  split: {RS: [0.8, 0.1, 0.1]}   # internal split for early stopping only, real test is ml-1m-realtime
+  group_by: user
+  order: TO
+  mode: full
+
+metrics: [Recall, NDCG]
+topk: [10]
+valid_metric: Recall@10

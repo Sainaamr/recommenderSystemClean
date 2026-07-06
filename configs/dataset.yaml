@@ -1,0 +1,15 @@
+# Dataset configuration — swap dataset name here to change datasets
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+RATING_FIELD: rating
+TIME_FIELD: timestamp
+
+load_col:
+  inter: [user_id, item_id, rating, timestamp]
+
+# Minimum interactions per user/item to filter sparse data
+val_interval:
+  rating: "[3, inf)"        # only keep ratings >= 3 as positive
+
+user_inter_num_interval: "[10, inf)"
+item_inter_num_interval: "[10, inf)"

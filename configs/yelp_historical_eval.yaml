@@ -1,0 +1,17 @@
+# Evaluation config for Yelp historical training only.
+# Real test set is yelp-realtime — no test split needed here.
+#
+# mode: uni100 instead of full — "full" ranks all 38k items for all 60k users
+# (2.3 billion pairs) after every epoch and at final evaluation, which takes
+# hours on CPU. uni100 samples 100 negatives per user, which is fast and
+# sufficient for early stopping signal. Final accuracy numbers come from
+# the realtime streaming evaluation, not this internal split.
+eval_args:
+  split: {RS: [0.8, 0.1, 0.1]}   # internal split for early stopping only
+  group_by: user
+  order: TO
+  mode: uni100
+
+metrics: [Recall, NDCG]
+topk: [10]
+valid_metric: Recall@10
