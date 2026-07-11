@@ -525,6 +525,13 @@ def main():
     results.to_csv(cfg["results_csv"], index=False)
     print(f"\nResults saved → {cfg['results_csv']}")
 
+    # Historical training energy is only otherwise persisted in the
+    # gitignored saved/*.energy.json sidecar — mirror it into results/
+    # (git-tracked) so it survives independently of the checkpoint.
+    energy_summary_path = Path(str(cfg["results_csv"]).replace(".csv", "_training_energy.json"))
+    energy_summary_path.write_text(json.dumps({"training_energy_uwh": training_energy_uwh}))
+    print(f"Training energy saved → {energy_summary_path}")
+
     plot_results(results, cfg, training_energy_uwh=training_energy_uwh)
 
     # Summary

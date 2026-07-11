@@ -107,12 +107,22 @@ def plot_recall_over_time(ax, df: pd.DataFrame, update_every: int):
 
 def plot_energy_bars(ax, df: pd.DataFrame, bar_width: int = 800,
                      training_energy_uwh: float = None):
-    """Plot energy cost per incremental update as bars, plus a reference
-    line for the one-time historical training energy (if provided)."""
-    updates = df[(df["strategy"] == "incremental") & (df["updated"])]
-    ax.bar(updates["interactions"], updates["update_energy_uwh"],
-           width=bar_width, color=COLORS["incremental"], alpha=0.7,
-           label="Incremental update energy")
+    """Plot energy cost per update as bars (incremental + full_retrain,
+    side by side where both occur), plus a reference line for the
+    one-time historical training energy (if provided)."""
+    inc_updates = df[(df["strategy"] == "incremental") & (df["updated"])]
+    retrain_updates = df[(df["strategy"] == "full_retrain") & (df["updated"])]
+
+    has_both = len(inc_updates) and len(retrain_updates)
+    offset = bar_width * 0.55 if has_both else 0
+    if len(inc_updates):
+        ax.bar(inc_updates["interactions"] - offset, inc_updates["update_energy_uwh"],
+               width=bar_width, color=COLORS["incremental"], alpha=0.7,
+               label="Incremental update energy")
+    if len(retrain_updates):
+        ax.bar(retrain_updates["interactions"] + offset, retrain_updates["update_energy_uwh"],
+               width=bar_width, color=COLORS["hybrid"], alpha=0.7,
+               label="Full retrain energy")
     if training_energy_uwh is not None:
         ax.axhline(training_energy_uwh, color=COLORS["no_update"],
                    linewidth=1.5, linestyle="--",
@@ -120,7 +130,7 @@ def plot_energy_bars(ax, df: pd.DataFrame, bar_width: int = 800,
     style_ax(ax,
              xlabel="Interactions seen (real-time stream)",
              ylabel="Update energy (µWh)",
-             title="Energy Cost per Incremental Update")
+             title="Energy Cost per Update")
 
 
 def plot_streaming_results(df: pd.DataFrame, out_path: Path,
