@@ -37,13 +37,15 @@ def style_ax(ax, xlabel=None, ylabel=None, title=None):
 
 
 METRIC_LABELS = {
-    "recall_at_10": "Recall@10",
-    "ndcg_at_10":   "NDCG@10",
-    "hr_at_10":     "HR@10",
-    "recall_at_20": "Recall@20",
-    "ndcg_at_20":   "NDCG@20",
-    "hr_at_20":     "HR@20",
-    "mrr":          "MRR",
+    "recall_at_10":    "Recall@10",
+    "precision_at_10": "Precision@10",
+    "ndcg_at_10":      "NDCG@10",
+    "hr_at_10":        "HR@10",
+    "recall_at_20":    "Recall@20",
+    "precision_at_20": "Precision@20",
+    "ndcg_at_20":      "NDCG@20",
+    "hr_at_20":        "HR@20",
+    "mrr":             "MRR",
 }
 
 STRATEGY_COLORS = COLORS  # alias for clarity outside this module
@@ -103,12 +105,18 @@ def plot_recall_over_time(ax, df: pd.DataFrame, update_every: int):
     plot_metric_over_time(ax, df, update_every, metric="recall_at_10")
 
 
-def plot_energy_bars(ax, df: pd.DataFrame, bar_width: int = 800):
-    """Plot energy cost per incremental update as bars."""
+def plot_energy_bars(ax, df: pd.DataFrame, bar_width: int = 800,
+                     training_energy_uwh: float = None):
+    """Plot energy cost per incremental update as bars, plus a reference
+    line for the one-time historical training energy (if provided)."""
     updates = df[(df["strategy"] == "incremental") & (df["updated"])]
     ax.bar(updates["interactions"], updates["update_energy_uwh"],
            width=bar_width, color=COLORS["incremental"], alpha=0.7,
            label="Incremental update energy")
+    if training_energy_uwh is not None:
+        ax.axhline(training_energy_uwh, color=COLORS["no_update"],
+                   linewidth=1.5, linestyle="--",
+                   label=f"Historical training energy (one-time, {training_energy_uwh:.2f} µWh)")
     style_ax(ax,
              xlabel="Interactions seen (real-time stream)",
              ylabel="Update energy (µWh)",
@@ -116,7 +124,8 @@ def plot_energy_bars(ax, df: pd.DataFrame, bar_width: int = 800):
 
 
 def plot_streaming_results(df: pd.DataFrame, out_path: Path,
-                           title: str, update_every: int):
+                           title: str, update_every: int,
+                           training_energy_uwh: float = None):
     """
     One PNG per available metric + one energy PNG.
     out_path is used as base — metric name suffix added per file.
@@ -138,7 +147,7 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
     # Energy plot
     fig, ax = plt.subplots(figsize=(12, 4))
     fig.suptitle(title, fontsize=13)
-    plot_energy_bars(ax, df)
+    plot_energy_bars(ax, df, training_energy_uwh=training_energy_uwh)
     plt.tight_layout()
     energy_path = Path(f"{base}_energy.png")
     plt.savefig(energy_path, dpi=DPI)

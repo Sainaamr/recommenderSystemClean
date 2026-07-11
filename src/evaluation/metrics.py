@@ -38,21 +38,30 @@ def compute_metrics_at_ks(scores: np.ndarray, gt_items: set, user_history: set,
     for k in ks:
         top_k = top_max_sorted[:k]
         hits = set(top_k) & gt_items
+        # N_rs = len(hits) (Herlocker et al. 2004, Table I). Recall's
+        # denominator (N_r) is this batch's ground truth size — a prequential
+        # approximation, not the full true relevant set (impractical to know
+        # online) — so these numbers are comparative across strategies/batches,
+        # not absolute. Precision's denominator (N_s) is just k, since exactly
+        # k items are always selected.
         recall = len(hits) / max(len(gt_items), 1)
+        precision = len(hits) / k
         hr = 1.0 if hits else 0.0
         dcg = sum(1.0 / np.log2(rank + 2)
                   for rank, item in enumerate(top_k) if item in gt_items)
         ideal = sum(1.0 / np.log2(rank + 2) for rank in range(min(len(gt_items), k)))
         ndcg = dcg / ideal if ideal > 0 else 0.0
-        out[f"recall@{k}"] = recall
-        out[f"ndcg@{k}"]   = ndcg
-        out[f"hr@{k}"]     = hr
+        out[f"recall@{k}"]    = recall
+        out[f"precision@{k}"] = precision
+        out[f"ndcg@{k}"]      = ndcg
+        out[f"hr@{k}"]        = hr
     return out
 
 
 def _avg(results):
     if not results:
-        keys = ["recall@10", "ndcg@10", "hr@10", "recall@20", "ndcg@20", "hr@20", "mrr"]
+        keys = ["recall@10", "precision@10", "ndcg@10", "hr@10",
+                "recall@20", "precision@20", "ndcg@20", "hr@20", "mrr"]
         return {k: 0.0 for k in keys}
     return {m: float(np.mean([r[m] for r in results])) for m in results[0]}
 

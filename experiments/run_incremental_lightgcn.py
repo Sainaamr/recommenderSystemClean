@@ -434,9 +434,11 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             "interactions":      (i + 1) * BATCH_SIZE,
             "strategy":          strategy,
             "recall_at_10":      m["recall@10"],
+            "precision_at_10":   m["precision@10"],
             "ndcg_at_10":        m["ndcg@10"],
             "hr_at_10":          m["hr@10"],
             "recall_at_20":      m["recall@20"],
+            "precision_at_20":   m["precision@20"],
             "ndcg_at_20":        m["ndcg@20"],
             "hr_at_20":          m["hr@20"],
             "mrr":               m["mrr"],
@@ -453,8 +455,9 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
 # Step 6: Plot results
 
-def plot_results(df: pd.DataFrame, cfg: dict):
-    plot_streaming_results(df, cfg["results_png"], cfg["plot_title"], UPDATE_EVERY)
+def plot_results(df: pd.DataFrame, cfg: dict, training_energy_uwh: float = None):
+    plot_streaming_results(df, cfg["results_png"], cfg["plot_title"], UPDATE_EVERY,
+                           training_energy_uwh=training_energy_uwh)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -522,7 +525,7 @@ def main():
     results.to_csv(cfg["results_csv"], index=False)
     print(f"\nResults saved → {cfg['results_csv']}")
 
-    plot_results(results, cfg)
+    plot_results(results, cfg, training_energy_uwh=training_energy_uwh)
 
     # Summary
     avg_no_update   = df_no_update["recall_at_10"].mean()
