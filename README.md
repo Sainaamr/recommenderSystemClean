@@ -116,11 +116,15 @@ Long-running — use `screen` (or `tmux`) so it survives disconnecting:
 screen -S recsys
 cd ~/recommenderSystemClean
 source .venv/bin/activate
-python3 experiments/run_incremental_lightgcn.py --dataset yelp
+python3 experiments/run_incremental_lightgcn.py --dataset yelp --no-update --incremental --full-retrain
 ```
 
-Add `--full-retrain` to also run the (expensive) full-retrain baseline
-strategy. Detach with `Ctrl+A` then `D`; reattach later with `screen -r recsys`.
+Each strategy is opt-in via its own flag — `--no-update`, `--incremental`,
+`--full-retrain` — and at least one is required. Mix and match to run only
+what you need (e.g. just `--incremental` while iterating on its
+hyperparameters). `--full-retrain` is the expensive one (retrains LightGCN
+from scratch every `update_every` batches via RecBole). Detach with `Ctrl+A`
+then `D`; reattach later with `screen -r recsys`.
 
 Results land in `results/{dataset}_hybrid_results_{timestamp}.csv` (per-batch
 Recall/NDCG/HR/MRR + energy) and a matching `_incremental_epochs.csv`

@@ -35,7 +35,6 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import torch
 from codecarbon import EmissionsTracker
 
 from recbole.quick_start import run_recbole
@@ -339,8 +338,8 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         if batch_users:
             m = batch_metrics_lgcn(model, batch_users, batch_items, history, k=TOP_K)
         else:
-            m = {"recall@10": 0.0, "ndcg@10": 0.0, "hr@10": 0.0,
-                 "recall@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
+            m = {"recall@10": 0.0, "precision@10": 0.0, "ndcg@10": 0.0, "hr@10": 0.0,
+                 "recall@20": 0.0, "precision@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
         recall = m["recall@10"]
 
         update_energy_uwh = 0.0
@@ -460,7 +459,10 @@ def plot_results(df: pd.DataFrame, cfg: dict, training_energy_uwh: float = None)
                            training_energy_uwh=training_energy_uwh)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
+
+STRATEGIES = ["no_update", "incremental", "full_retrain"]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -468,10 +470,19 @@ def main():
                         help="Dataset to run the experiment on")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                         help="Directory to save results (default: results/)")
+    parser.add_argument("--no-update", action="store_true",
+                        help="Run the no_update baseline strategy (model never updates)")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Run the incremental update strategy")
     parser.add_argument("--full-retrain", action="store_true",
-                        help="Also run the full-retrain baseline (expensive — "
+                        help="Run the full-retrain baseline (expensive — "
                              "retrains LightGCN from scratch every update_every batches)")
     args = parser.parse_args()
+
+    run_flags = {"no_update": args.no_update, "incremental": args.incremental,
+                 "full_retrain": args.full_retrain}
+    if not any(run_flags.values()):
+        parser.error("at least one of --no-update, --incremental, --full-retrain is required")
 
     results_dir = args.results_dir
     cfg = DATASET_CONFIGS[args.dataset].copy()
@@ -487,41 +498,22 @@ def main():
     # Step 1: Train or load checkpoint
     checkpoint, training_energy_uwh = train_historical(cfg)
 
-    # Step 2: Load model and ID mappings
-    print("\nLoading model and building ID mappings...")
-    user2id, item2id, config, dataset = load_id_mappings(cfg)
-    model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
-
-    # Step 3: Build historical profiles
-    print("Building user history from historical data...")
-    user_history = build_user_history(user2id, item2id, cfg)
-
-    # Step 4: No-update strategy
-    df_no_update = run_streaming(model, user2id, item2id, user_history, strategy="no_update", cfg=cfg)
-
-    # Reload clean model for incremental strategy (so strategies start from same weights)
-    print("\nReloading model for incremental strategy...")
-    user2id, item2id, config, dataset = load_id_mappings(cfg)
-    model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
-    user_history = build_user_history(user2id, item2id, cfg)
-
-    # Step 5: Incremental strategy
-    df_incremental = run_streaming(model, user2id, item2id, user_history, strategy="incremental", cfg=cfg)
-
-    all_dfs = [df_no_update, df_incremental]
-
-    # Step 5b: Full-retrain baseline (opt-in — expensive)
-    df_full_retrain = None
-    if args.full_retrain:
-        print("\nReloading model for full_retrain strategy...")
+    # Step 2: Run each requested strategy, each starting from a fresh copy
+    # of the same historical checkpoint (so strategies are directly
+    # comparable, none of them chain off another's updated weights).
+    dfs = {}
+    for strategy in STRATEGIES:
+        if not run_flags[strategy]:
+            continue
+        print(f"\nLoading model for {strategy} strategy...")
         user2id, item2id, config, dataset = load_id_mappings(cfg)
         model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
         user_history = build_user_history(user2id, item2id, cfg)
-        df_full_retrain = run_streaming(model, user2id, item2id, user_history, strategy="full_retrain", cfg=cfg)
-        all_dfs.append(df_full_retrain)
+        dfs[strategy] = run_streaming(model, user2id, item2id, user_history,
+                                      strategy=strategy, cfg=cfg)
 
-    # Step 6: Save and plot
-    results = pd.concat(all_dfs, ignore_index=True)
+    # Step 3: Save and plot
+    results = pd.concat(list(dfs.values()), ignore_index=True)
     results.to_csv(cfg["results_csv"], index=False)
     print(f"\nResults saved → {cfg['results_csv']}")
 
@@ -535,27 +527,18 @@ def main():
     plot_results(results, cfg, training_energy_uwh=training_energy_uwh)
 
     # Summary
-    avg_no_update   = df_no_update["recall_at_10"].mean()
-    avg_incremental = df_incremental["recall_at_10"].mean()
-    total_energy    = df_incremental["update_energy_uwh"].sum()
-    n_updates       = int(df_incremental["updated"].sum())
-
     print("\n── Summary ──────────────────────────────────────────────")
-    print(f"  Avg Recall@10 (no update):   {avg_no_update:.4f}")
-    print(f"  Avg Recall@10 (incremental): {avg_incremental:.4f}")
     print(f"  Historical training energy:  {training_energy_uwh:.4f} µWh")
-    print(f"  Total incremental update energy: {total_energy:.4f} µWh")
-    print(f"  Number of updates:           {n_updates}")
-    print(f"  Avg energy per update:       {total_energy / max(n_updates, 1):.4f} µWh")
-
-    if df_full_retrain is not None:
-        avg_full_retrain   = df_full_retrain["recall_at_10"].mean()
-        total_retrain_energy = df_full_retrain["update_energy_uwh"].sum()
-        n_retrains          = int(df_full_retrain["updated"].sum())
-        print(f"  Avg Recall@10 (full retrain): {avg_full_retrain:.4f}")
-        print(f"  Total full-retrain energy:    {total_retrain_energy:.4f} µWh")
-        print(f"  Number of retrains:           {n_retrains}")
-        print(f"  Avg energy per retrain:       {total_retrain_energy / max(n_retrains, 1):.4f} µWh")
+    for strategy, df in dfs.items():
+        avg_recall = df["recall_at_10"].mean()
+        print(f"  Avg Recall@10 ({strategy}): {avg_recall:.4f}")
+        if strategy == "no_update":
+            continue
+        total_energy = df["update_energy_uwh"].sum()
+        n_updates    = int(df["updated"].sum())
+        print(f"  Total {strategy} energy:      {total_energy:.4f} µWh")
+        print(f"  Number of {strategy} updates: {n_updates}")
+        print(f"  Avg energy per update:       {total_energy / max(n_updates, 1):.4f} µWh")
 
 
 if __name__ == "__main__":

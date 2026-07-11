@@ -10,6 +10,7 @@ from pathlib import Path
 COLORS = {
     "no_update":            "#e63946",
     "incremental":          "#2a9d8f",
+    "full_retrain":         "#e7ab51",
     "lightgcn_incremental": "#2a9d8f",
     "fixed_interval":       "#2a9d8f",
     "adaptive_drift":       "#6a4c93",
@@ -58,12 +59,12 @@ def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
     Faint raw lines + bold smoothed trend. Dashed lines mark update moments.
     """
     ylabel = METRIC_LABELS.get(metric, metric)
-    strategies = df["strategy"].unique()
 
     # Support both 2-strategy (no_update/incremental) and multi-strategy (hybrid serving)
     label_map = {
         "no_update":            "No update (model goes stale)",
         "incremental":          f"Incremental update (every {update_every} batches)",
+        "full_retrain":         f"Full retrain (every {update_every} batches)",
         "lightgcn_incremental": "LightGCN incremental",
         "fixed_interval":       f"Fixed interval (every {update_every} batches)",
         "adaptive_drift":       "Adaptive drift trigger (cosine similarity)",
@@ -82,13 +83,15 @@ def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
         ax.plot(grp["interactions"], smoothed,
                 color=color, label=label, linewidth=2.0)
 
+    # Dashed vertical lines mark update moments, one color per updating
+    # strategy (no_update never has updated=True rows, so it's naturally
+    # excluded).
     updates = df[df.get("updated", pd.Series(False, index=df.index)) == True]
-    inc_updates = updates[updates["strategy"].isin(["incremental", "lightgcn_incremental", "hybrid"])]
-    for x in inc_updates["interactions"]:
-        ax.axvline(x, color=COLORS["incremental"], alpha=0.25, linewidth=0.8, linestyle="--")
-    if len(inc_updates):
-        ax.axvline(inc_updates["interactions"].iloc[0], color=COLORS["incremental"],
-                   alpha=0.25, linewidth=0.8, linestyle="--", label="Update triggered")
+    for strategy, grp in updates.groupby("strategy"):
+        color = COLORS.get(strategy, COLORS["incremental"])
+        for j, x in enumerate(grp["interactions"]):
+            ax.axvline(x, color=color, alpha=0.25, linewidth=0.8, linestyle="--",
+                       label=f"{label_map.get(strategy, strategy)} triggered" if j == 0 else None)
 
     max_x = int(df["interactions"].max())
     ax.yaxis.set_minor_locator(plt.MultipleLocator(0.005))
