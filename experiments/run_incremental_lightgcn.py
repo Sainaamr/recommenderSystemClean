@@ -49,7 +49,7 @@ from tools.plot_utils import plot_streaming_results
 # ── Parameters ───────────────────────────────────────────────────────────────
 BATCH_SIZE    = 1000
 UPDATE_EVERY  = 20    # run incremental_update every N batches
-UPDATE_EPOCHS = 50    # max gradient steps per incremental update (early stopping may cut this short)
+UPDATE_EPOCHS = 100   # max gradient steps per incremental update (early stopping may cut this short)
 TOP_K         = 10
 RESULTS_DIR   = Path("results")
 # ─────────────────────────────────────────────────────────────────────────────

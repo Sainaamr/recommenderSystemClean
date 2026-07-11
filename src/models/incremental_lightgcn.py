@@ -182,10 +182,11 @@ class IncrementalLightGCN(LightGCN):
         self,
         user_ids: np.ndarray,
         item_ids: np.ndarray,
-        n_epochs: int = 50,
+        n_epochs: int = 100,
         learning_rate: float = 0.001,
         val_fraction: float = 0.1,
         patience: int = 5,
+        rel_delta: float = 1e-3,
     ):
         """
         Run BPR gradient steps on new interactions only, warm-started from
@@ -196,11 +197,17 @@ class IncrementalLightGCN(LightGCN):
 
         A fraction of the batch (val_fraction) is held out as a validation
         slice, evaluated on BPR loss after every epoch. Training stops early
-        once validation loss hasn't improved for `patience` consecutive
+        once validation loss hasn't improved by at least a relative fraction
+        `rel_delta` of the best loss so far, for `patience` consecutive
         epochs, and the best-validation-loss weights seen during this update
         are restored at the end — so additional epochs (up to n_epochs) are
         only spent while they still buy real improvement, instead of always
         running a fixed epoch count regardless of whether it's still helping.
+        A relative (not absolute) threshold is used because training is
+        full-batch, so the loss curve is smooth and monotonic rather than
+        noisy — an absolute delta like 1e-5 is satisfied by almost any epoch
+        regardless of scale, while a relative delta stays meaningful as the
+        loss shrinks.
         """
 
         # before updating the model mode is set to training mode. this is not neccesary for lightgcn
@@ -282,7 +289,7 @@ class IncrementalLightGCN(LightGCN):
                     val_neg_scores = torch.mul(user_all_emb[val_users], item_all_emb[val_neg]).sum(dim=1)
                     val_loss = self.mf_loss(val_pos_scores, val_neg_scores).item()
 
-                if val_loss < best_val_loss - 1e-5:
+                if val_loss < best_val_loss * (1 - rel_delta):
                     best_val_loss = val_loss
                     best_state = copy.deepcopy(self.state_dict())
                     epochs_no_improve = 0
