@@ -22,6 +22,8 @@ Usage:
     scores = model.full_sort_predict(interaction)
 """
 
+import copy
+
 import numpy as np
 import scipy.sparse as sp
 import torch
@@ -54,30 +56,29 @@ class IncrementalLightGCN(LightGCN):
         return model
 
     # Embedding expansion for new users/items
-
+        """
+        new_n_users: Total number of user rows of the model's embedding table post expansion
+        new_n_items: Total number of item rows of the model's embedding table post expansion
+        """
     def expand_embeddings(self, new_n_users: int, new_n_items: int):
         """
         Expand user and/or item embedding matrices to accommodate new entities.
         New rows are initialized with the mean of all existing embeddings so
         new users/items start with an average representation rather than random noise.
-
-        Called automatically by add_interactions when new IDs are detected.
-        Can also be called directly for no_update strategy to register new
-        entities without touching the graph.
-
-        Example:
-            model has 6022 users. A new user gets assigned ID 6022.
-            expand_embeddings(6023, ...) adds one row to user_embedding
-            initialized as mean of rows 0..6021.
         """
         if new_n_users > self.n_users:
             old_weight = self.user_embedding.weight.data
-            # mean of all existing user embeddings → reasonable starting point
+            # mean of all existing user embeddings down column for each dimension keep the shape
+            # as table with one row
             mean_emb = old_weight.mean(dim=0, keepdim=True)
             n_new = new_n_users - self.n_users
+            # exand the table only for new rows and no new column and save it in new place
             new_rows = mean_emb.expand(n_new, -1).clone()
             new_weight = torch.cat([old_weight, new_rows], dim=0)
+
+            # create new table with the right size becuase pytoch's nn.embedding size is fixed
             self.user_embedding = nn.Embedding(new_n_users, self.latent_dim)
+            # set the expanded embedding and mark as trainable
             self.user_embedding.weight = nn.Parameter(new_weight)
             self.user_embedding.to(self.device)
             self.n_users = new_n_users
@@ -87,6 +88,7 @@ class IncrementalLightGCN(LightGCN):
             old_weight = self.item_embedding.weight.data
             mean_emb = old_weight.mean(dim=0, keepdim=True)
             n_new = new_n_items - self.n_items
+
             new_rows = mean_emb.expand(n_new, -1).clone()
             new_weight = torch.cat([old_weight, new_rows], dim=0)
             self.item_embedding = nn.Embedding(new_n_items, self.latent_dim)
@@ -95,13 +97,15 @@ class IncrementalLightGCN(LightGCN):
             self.n_items = new_n_items
             print(f"  Expanded item embeddings: {new_n_items - n_new} → {new_n_items} (+{n_new} new items)")
 
-        # Rebuild interaction matrix and adjacency matrix with new shape.
-        # Edges stay the same — only the matrix dimensions grow.
+
         data = np.ones(len(self._coo_rows), dtype=np.float32)
+        # build a matrix one row per user and one column per item and each entry is one if there
+        # is an interaction between that item and user
         self.interaction_matrix = sp.coo_matrix(
             (data, (np.array(self._coo_rows), np.array(self._coo_cols))),
             shape=(self.n_users, self.n_items),
         )
+        # calculate the adj matrix using the recbole implementation
         self.norm_adj_matrix = self.get_norm_adj_mat().to(self.device)
 
         # Invalidate cache after any expansion
@@ -109,14 +113,14 @@ class IncrementalLightGCN(LightGCN):
         self.restore_item_e = None
 
     # Graph update 
-
+    """
+    user_ids: New users being added
+    item_ids: New items being added
+    """
     def add_interactions(self, user_ids: np.ndarray, item_ids: np.ndarray):
         """
         Add new user-item interactions to the graph and recompute the
         normalized adjacency matrix. Existing embeddings are preserved.
-
-        New users/items (IDs outside current matrix size) are handled
-        automatically — embeddings are expanded with mean initialization.
         """
         # Expand embeddings if any new user/item IDs are outside current range
         max_user = int(user_ids.max()) + 1 if len(user_ids) > 0 else self.n_users
@@ -144,22 +148,59 @@ class IncrementalLightGCN(LightGCN):
         self.restore_user_e = None
         self.restore_item_e = None
 
-    # ── Incremental training ──────────────────────────────────────────────────
+    # Negative sampling
+    """
+    users_np: Users we want a negative sample for 
+    csr     : interaction matrix
+    """
+    def _sample_negatives(self, users_np: np.ndarray, csr) -> np.ndarray:
+        """
+        Draw one negative item per given user, guaranteed not to be an item
+        that user has already interacted with — rejection sampling, matching
+        RecBole's own Sampler (recbole/sampler/sampler.py) and the LightGCN
+        paper's negative sampling: draw uniformly, then re-sample only the
+        draws that collided with a true positive, repeating until clean.
+        """
+        n = len(users_np)
+        neg_ids = np.random.randint(0, self.n_items, size=n)
+        check_list = np.arange(n)
+        while len(check_list) > 0:
+            collide = [
+                idx for idx in check_list
+                if neg_ids[idx] in csr.indices[csr.indptr[users_np[idx]]: csr.indptr[users_np[idx] + 1]]
+            ]
+            if not collide:
+                break
+            collide = np.array(collide)
+            neg_ids[collide] = np.random.randint(0, self.n_items, size=len(collide))
+            check_list = collide
+        return neg_ids
+
+    # Incremental training
 
     def incremental_update(
         self,
         user_ids: np.ndarray,
         item_ids: np.ndarray,
-        n_epochs: int = 5,
+        n_epochs: int = 50,
         learning_rate: float = 0.001,
-        n_neg_samples: int = 1,
+        val_fraction: float = 0.1,
+        patience: int = 5,
     ):
         """
-        Run a small number of BPR gradient steps on new interactions only.
-        Warm-starts from existing embeddings — much cheaper than full retraining.
-        !!!!!!!
-        n_neg_samples for later
-        !!!!!!!
+        Run BPR gradient steps on new interactions only, warm-started from
+        existing embeddings — much cheaper than full retraining. One
+        rejection-sampled negative per positive (see _sample_negatives),
+        matching RecBole's default sample_num=1 and the LightGCN paper's
+        standard BPR formulation.
+
+        A fraction of the batch (val_fraction) is held out as a validation
+        slice, evaluated on BPR loss after every epoch. Training stops early
+        once validation loss hasn't improved for `patience` consecutive
+        epochs, and the best-validation-loss weights seen during this update
+        are restored at the end — so additional epochs (up to n_epochs) are
+        only spent while they still buy real improvement, instead of always
+        running a fixed epoch count regardless of whether it's still helping.
         """
 
         # before updating the model mode is set to training mode. this is not neccesary for lightgcn
@@ -169,13 +210,38 @@ class IncrementalLightGCN(LightGCN):
         # As in paper implementation
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 
-        user_tensor = torch.LongTensor(user_ids).to(self.device)
-        pos_tensor  = torch.LongTensor(item_ids).to(self.device)
+        # CSR view of the interaction graph, used for negative-sampling
+        # rejection checks below. Built once per update (not per epoch) —
+        # already reflects this batch's new edges, since add_interactions()
+        # is always called before incremental_update() by the caller.
+        csr = self.interaction_matrix.tocsr()
+
+        # Hold out a validation slice, fixed for the whole update, so
+        # validation loss is comparable across epochs.
+        n = len(user_ids)
+        perm = np.random.permutation(n)
+        n_val = max(1, int(n * val_fraction)) if n > 1 else 0
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+        train_users = torch.LongTensor(user_ids[train_idx]).to(self.device)
+        train_pos   = torch.LongTensor(item_ids[train_idx]).to(self.device)
+
+        val_users = torch.LongTensor(user_ids[val_idx]).to(self.device)
+        val_pos   = torch.LongTensor(item_ids[val_idx]).to(self.device)
+        # Fixed validation negatives (not resampled per epoch) so validation
+        # loss is comparable across epochs. Rejection-sampled so a "negative"
+        # can never actually be an item this user already interacted with.
+        val_neg_ids = self._sample_negatives(user_ids[val_idx], csr)
+        val_neg = torch.LongTensor(val_neg_ids).to(self.device)
+
+        best_val_loss = float("inf")
+        best_state = copy.deepcopy(self.state_dict())
+        epochs_no_improve = 0
 
         for epoch in range(n_epochs):
-            # Sample random negatives (items not in this batch's positives).
-            # The idea is that most likely the randomly picked id is an item that the user didn't interact with
-            neg_ids = np.random.randint(0, self.n_items, size=len(item_ids))
+            # Rejection-sampled negatives — guaranteed not to be items this
+            # user already interacted with (see _sample_negatives).
+            neg_ids = self._sample_negatives(user_ids[train_idx], csr)
             neg_tensor = torch.LongTensor(neg_ids).to(self.device)
 
             # resets all stored gradients to zero before computing fresh ones
@@ -186,8 +252,8 @@ class IncrementalLightGCN(LightGCN):
             # calculate the embeddings
             user_all_emb, item_all_emb = self.forward()
 
-            u_emb   = user_all_emb[user_tensor]
-            pos_emb = item_all_emb[pos_tensor]
+            u_emb   = user_all_emb[train_users]
+            pos_emb = item_all_emb[train_pos]
             neg_emb = item_all_emb[neg_tensor]
 
             # calculate the scores
@@ -197,8 +263,8 @@ class IncrementalLightGCN(LightGCN):
             # measure the mistakes
             bpr_loss = self.mf_loss(pos_scores, neg_scores)
             reg_loss = self.reg_loss(
-                self.user_embedding(user_tensor),
-                self.item_embedding(pos_tensor),
+                self.user_embedding(train_users),
+                self.item_embedding(train_pos),
                 self.item_embedding(neg_tensor),
                 require_pow=self.require_pow,
             )
@@ -208,8 +274,35 @@ class IncrementalLightGCN(LightGCN):
             loss.backward()
             optimizer.step()
 
+            # Validation check — did this epoch actually improve things?
+            if len(val_idx) > 0: # this safe gaurd should never be used
+                with torch.no_grad():
+                    user_all_emb, item_all_emb = self.forward()
+                    val_pos_scores = torch.mul(user_all_emb[val_users], item_all_emb[val_pos]).sum(dim=1)
+                    val_neg_scores = torch.mul(user_all_emb[val_users], item_all_emb[val_neg]).sum(dim=1)
+                    val_loss = self.mf_loss(val_pos_scores, val_neg_scores).item()
+
+                if val_loss < best_val_loss - 1e-5:
+                    best_val_loss = val_loss
+                    best_state = copy.deepcopy(self.state_dict())
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= patience:
+                        break
+
+        print(f"  Incremental update: ran {epoch + 1}/{n_epochs} epochs"
+              + (f" (best val_loss={best_val_loss:.4f})" if len(val_idx) > 0 else ""))
+
+        # Restore the best-validation-loss weights seen during this update
+        # (not necessarily the weights from the very last epoch)
+        if len(val_idx) > 0:
+            self.load_state_dict(best_state)
+
         # set the model mode to evaluate
         self.eval()
         # Invalidate cache so next recommendation uses updated embeddings
         self.restore_user_e = None
         self.restore_item_e = None
+
+        return epoch + 1, (best_val_loss if len(val_idx) > 0 else None)
