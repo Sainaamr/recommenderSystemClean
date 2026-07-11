@@ -89,17 +89,6 @@ produced against this project's data):
    ```
 3. Place the resulting `yelp.inter` at `dataset/yelp/yelp.inter` in this repo.
 
-If you already have a converted `yelp.inter` elsewhere (e.g. from a local
-machine), transfer it directly instead of re-downloading/re-converting:
-
-```bash
-mkdir -p ~/recommenderSystemClean/dataset/yelp
-# from the machine that already has it:
-rsync -avz --progress -e "ssh -i <your_key>" \
-  <path_to_local>/dataset/yelp/yelp.inter \
-  <user>@<server>:~/recommenderSystemClean/dataset/yelp/yelp.inter
-```
-
 ### 6. Split into historical/realtime
 
 Per-user, time-ordered 80/20 split (first 80% of each user's interactions →
