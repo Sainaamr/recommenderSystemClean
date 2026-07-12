@@ -182,32 +182,17 @@ class IncrementalLightGCN(LightGCN):
         self,
         user_ids: np.ndarray,
         item_ids: np.ndarray,
-        n_epochs: int = 100,
+        n_epochs: int = 30,
         learning_rate: float = 0.001,
-        val_fraction: float = 0.1,
-        patience: int = 5,
-        rel_delta: float = 1e-3,
     ):
         """
-        Run BPR gradient steps on new interactions only, warm-started from
-        existing embeddings — much cheaper than full retraining. One
-        rejection-sampled negative per positive (see _sample_negatives),
-        matching RecBole's default sample_num=1 and the LightGCN paper's
-        standard BPR formulation.
-
-        A fraction of the batch (val_fraction) is held out as a validation
-        slice, evaluated on BPR loss after every epoch. Training stops early
-        once validation loss hasn't improved by at least a relative fraction
-        `rel_delta` of the best loss so far, for `patience` consecutive
-        epochs, and the best-validation-loss weights seen during this update
-        are restored at the end — so additional epochs (up to n_epochs) are
-        only spent while they still buy real improvement, instead of always
-        running a fixed epoch count regardless of whether it's still helping.
-        A relative (not absolute) threshold is used because training is
-        full-batch, so the loss curve is smooth and monotonic rather than
-        noisy — an absolute delta like 1e-5 is satisfied by almost any epoch
-        regardless of scale, while a relative delta stays meaningful as the
-        loss shrinks.
+        Run a fixed n_epochs BPR gradient steps on new interactions only,
+        warm-started from existing embeddings — much cheaper than full
+        retraining. One rejection-sampled negative per positive (see
+        _sample_negatives), matching RecBole's default sample_num=1 and the
+        LightGCN paper's standard BPR formulation. No early stopping — every
+        update runs exactly n_epochs, so the energy cost per update is fixed
+        and predictable.
         """
 
         # before updating the model mode is set to training mode. this is not neccesary for lightgcn
@@ -220,30 +205,15 @@ class IncrementalLightGCN(LightGCN):
         # CSR view of the interaction graph, used for negative-sampling
         csr = self.interaction_matrix.tocsr()
 
-        # Hold out a validation slice, fixed for the whole update, so
-        # validation loss is comparable across epochs.
-        n = len(user_ids)
-        perm = np.random.permutation(n)
-        n_val = max(1, int(n * val_fraction)) if n > 1 else 0
-        val_idx, train_idx = perm[:n_val], perm[n_val:]
-
-        train_users = torch.LongTensor(user_ids[train_idx]).to(self.device)
-        train_pos   = torch.LongTensor(item_ids[train_idx]).to(self.device)
-
-        train_neg_ids = self._sample_negatives(user_ids[train_idx], csr)
-        neg_tensor = torch.LongTensor(train_neg_ids).to(self.device)
-
-        val_users = torch.LongTensor(user_ids[val_idx]).to(self.device)
-        val_pos   = torch.LongTensor(item_ids[val_idx]).to(self.device)
-
-        val_neg_ids = self._sample_negatives(user_ids[val_idx], csr)
-        val_neg = torch.LongTensor(val_neg_ids).to(self.device)
-
-        best_val_loss = float("inf")
-        best_state = copy.deepcopy(self.state_dict())
-        epochs_no_improve = 0
+        train_users = torch.LongTensor(user_ids).to(self.device)
+        train_pos   = torch.LongTensor(item_ids).to(self.device)
 
         for epoch in range(n_epochs):
+            # Rejection-sampled negatives — guaranteed not to be items this
+            # user already interacted with (see _sample_negatives).
+            neg_ids = self._sample_negatives(user_ids, csr)
+            neg_tensor = torch.LongTensor(neg_ids).to(self.device)
+
             # resets all stored gradients to zero before computing fresh ones
             # A gradient is just a number that answers:
             # "if I increase this weight slightly, does the loss go up or down, and by how much?"
@@ -274,30 +244,8 @@ class IncrementalLightGCN(LightGCN):
             loss.backward()
             optimizer.step()
 
-            # Validation check — did this epoch actually improve things?
-            if len(val_idx) > 0: # this safe gaurd should never be used
-                with torch.no_grad():
-                    user_all_emb, item_all_emb = self.forward()
-                    val_pos_scores = torch.mul(user_all_emb[val_users], item_all_emb[val_pos]).sum(dim=1)
-                    val_neg_scores = torch.mul(user_all_emb[val_users], item_all_emb[val_neg]).sum(dim=1)
-                    val_loss = self.mf_loss(val_pos_scores, val_neg_scores).item()
-
-                if val_loss < best_val_loss * (1 - rel_delta):
-                    best_val_loss = val_loss
-                    best_state = copy.deepcopy(self.state_dict())
-                    epochs_no_improve = 0
-                else:
-                    epochs_no_improve += 1
-                    if epochs_no_improve >= patience:
-                        break
-
-        print(f"  Incremental update: ran {epoch + 1}/{n_epochs} epochs"
-              + (f" (best val_loss={best_val_loss:.4f})" if len(val_idx) > 0 else ""))
-
-        # Restore the best-validation-loss weights seen during this update
-        # (not necessarily the weights from the very last epoch)
-        if len(val_idx) > 0:
-            self.load_state_dict(best_state)
+        final_loss = loss.item()
+        print(f"  Incremental update: ran {n_epochs}/{n_epochs} epochs (final loss={final_loss:.4f})")
 
         # set the model mode to evaluate
         self.eval()
@@ -305,4 +253,4 @@ class IncrementalLightGCN(LightGCN):
         self.restore_user_e = None
         self.restore_item_e = None
 
-        return epoch + 1, (best_val_loss if len(val_idx) > 0 else None)
+        return n_epochs, final_loss

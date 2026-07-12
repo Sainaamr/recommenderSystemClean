@@ -22,7 +22,7 @@ Outputs (timestamped to avoid overwriting previous runs):
   results/ml1m_hybrid_curves_YYYYMMDD_HHMMSS.png
 """
 
-import os, sys, glob, argparse, json, csv
+import os, sys, glob, argparse, json
 from pathlib import Path
 from datetime import datetime
 
@@ -48,7 +48,7 @@ from tools.plot_utils import plot_streaming_results
 # ── Parameters ───────────────────────────────────────────────────────────────
 BATCH_SIZE    = 1000
 UPDATE_EVERY  = 20    # run incremental_update every N batches
-UPDATE_EPOCHS = 100   # max gradient steps per incremental update (early stopping may cut this short)
+UPDATE_EPOCHS = 30    # fixed gradient steps per incremental update, no early stopping
 TOP_K         = 10
 RESULTS_DIR   = Path("results")
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,19 +363,10 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                 )
                 tracker.start()
                 model.add_interactions(new_users, new_items)
-                epochs_run, best_val_loss = model.incremental_update(new_users, new_items, n_epochs=UPDATE_EPOCHS)
+                model.incremental_update(new_users, new_items, n_epochs=UPDATE_EPOCHS)
                 kwh = tracker.stop() or 0.0
                 update_energy_uwh = kwh * 1e6
                 updated = True
-
-                # Log convergence info separately from the main results CSV
-                epochs_log_path = cfg["results_csv"].with_name(cfg["results_csv"].stem + "_incremental_epochs.csv")
-                log_exists = epochs_log_path.exists()
-                with open(epochs_log_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    if not log_exists:
-                        writer.writerow(["batch", "epochs_run", "max_epochs", "best_val_loss"])
-                    writer.writerow([i + 1, epochs_run, UPDATE_EPOCHS, best_val_loss])
 
                 # Clear buffer after update
                 buffer_users = []
