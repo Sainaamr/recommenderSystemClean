@@ -174,10 +174,10 @@ def build_user_history(user2id: dict, item2id: dict, cfg: dict) -> dict:
     Build user_internal_id (row number) → set of item_internal_ids (row numbers), from historical data.
     Only keeps users and items that exist in the trained model.
     """
+    # historical_path is produced by tools/split_dataset.py, which already
+    # filters to rating>=3 via RecBole (configs/*.yaml val_interval), so no
+    # re-filtering is needed here.
     df = pd.read_csv(cfg["historical_path"], sep="\t")
-
-    # keep only <= 3 rated items with the assumption it is liked
-    df = df[df["rating:float"] >= 3]
 
     # turn id raw id into string because mapping table built by load id mappings
     # is based on string
@@ -245,11 +245,11 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
     history = {uid: set(items) for uid, items in user_history.items()}
 
     if strategy == "full_retrain":
+        # both paths are pre-filtered to rating>=3 by tools/split_dataset.py
         realtime_df    = pd.read_csv(cfg["realtime_path"], sep="\t")
         historical_raw = pd.read_csv(cfg["historical_path"], sep="\t")
 
-        # filter rows for only rating of 3 star above
-        df = realtime_df[realtime_df["rating:float"] >= 3].copy()
+        df = realtime_df.copy()
 
         # hold original index
         # the different between this and iid / uid is that interactions of a user is not in one row rather
@@ -272,9 +272,8 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         consumed_raw_upto = -1 # mark how far along in realtime data we are
 
     else:
-        # same filter for other strategy
+        # realtime_path is pre-filtered to rating>=3 by tools/split_dataset.py
         df = pd.read_csv(cfg["realtime_path"], sep="\t")
-        df = df[df["rating:float"] >= 3].reset_index(drop=True)
 
         # Growing ID mappings — new users/items get assigned the next available ID
         # instead of being dropped. user2id and item2id are mutated in place.
