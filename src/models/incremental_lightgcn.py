@@ -218,9 +218,6 @@ class IncrementalLightGCN(LightGCN):
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
 
         # CSR view of the interaction graph, used for negative-sampling
-        # rejection checks below. Built once per update (not per epoch) —
-        # already reflects this batch's new edges, since add_interactions()
-        # is always called before incremental_update() by the caller.
         csr = self.interaction_matrix.tocsr()
 
         # Hold out a validation slice, fixed for the whole update, so
@@ -232,21 +229,13 @@ class IncrementalLightGCN(LightGCN):
 
         train_users = torch.LongTensor(user_ids[train_idx]).to(self.device)
         train_pos   = torch.LongTensor(item_ids[train_idx]).to(self.device)
-        # Fixed training negatives (not resampled per epoch) — otherwise the
-        # loss being optimized is a different function every epoch (whichever
-        # negatives happened to be drawn), which makes the validation loss
-        # curve noisy from epoch to epoch and prevents early stopping's
-        # `patience` counter from ever accumulating consecutive non-improving
-        # epochs. Rejection-sampled so a "negative" can never actually be an
-        # item this user already interacted with.
+
         train_neg_ids = self._sample_negatives(user_ids[train_idx], csr)
         neg_tensor = torch.LongTensor(train_neg_ids).to(self.device)
 
         val_users = torch.LongTensor(user_ids[val_idx]).to(self.device)
         val_pos   = torch.LongTensor(item_ids[val_idx]).to(self.device)
-        # Fixed validation negatives (not resampled per epoch) so validation
-        # loss is comparable across epochs. Rejection-sampled so a "negative"
-        # can never actually be an item this user already interacted with.
+
         val_neg_ids = self._sample_negatives(user_ids[val_idx], csr)
         val_neg = torch.LongTensor(val_neg_ids).to(self.device)
 

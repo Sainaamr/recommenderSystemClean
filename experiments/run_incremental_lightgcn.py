@@ -487,11 +487,15 @@ def main():
     cfg = DATASET_CONFIGS[args.dataset].copy()
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stamp output filenames with timestamp so runs never overwrite each other
+    # Stamp output filenames with the requested strategies + a timestamp, so
+    # runs never overwrite each other AND the filename alone tells you which
+    # strategy/strategies it holds (useful since strategies are often run as
+    # separate invocations rather than all together).
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_prefix = args.dataset.replace("-", "")
-    cfg["results_csv"] = results_dir / f"{dataset_prefix}_hybrid_results_{ts}.csv"
-    cfg["results_png"] = results_dir / f"{dataset_prefix}_hybrid_curves_{ts}.png"
+    strategy_tag = "_".join(s for s in STRATEGIES if run_flags[s])
+    cfg["results_csv"] = results_dir / f"{dataset_prefix}_hybrid_results_{strategy_tag}_{ts}.csv"
+    cfg["results_png"] = results_dir / f"{dataset_prefix}_hybrid_curves_{strategy_tag}_{ts}.png"
     print(f"Run timestamp: {ts}")
 
     # Step 1: Train or load checkpoint
