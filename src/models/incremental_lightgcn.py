@@ -232,6 +232,15 @@ class IncrementalLightGCN(LightGCN):
 
         train_users = torch.LongTensor(user_ids[train_idx]).to(self.device)
         train_pos   = torch.LongTensor(item_ids[train_idx]).to(self.device)
+        # Fixed training negatives (not resampled per epoch) — otherwise the
+        # loss being optimized is a different function every epoch (whichever
+        # negatives happened to be drawn), which makes the validation loss
+        # curve noisy from epoch to epoch and prevents early stopping's
+        # `patience` counter from ever accumulating consecutive non-improving
+        # epochs. Rejection-sampled so a "negative" can never actually be an
+        # item this user already interacted with.
+        train_neg_ids = self._sample_negatives(user_ids[train_idx], csr)
+        neg_tensor = torch.LongTensor(train_neg_ids).to(self.device)
 
         val_users = torch.LongTensor(user_ids[val_idx]).to(self.device)
         val_pos   = torch.LongTensor(item_ids[val_idx]).to(self.device)
@@ -246,11 +255,6 @@ class IncrementalLightGCN(LightGCN):
         epochs_no_improve = 0
 
         for epoch in range(n_epochs):
-            # Rejection-sampled negatives — guaranteed not to be items this
-            # user already interacted with (see _sample_negatives).
-            neg_ids = self._sample_negatives(user_ids[train_idx], csr)
-            neg_tensor = torch.LongTensor(neg_ids).to(self.device)
-
             # resets all stored gradients to zero before computing fresh ones
             # A gradient is just a number that answers:
             # "if I increase this weight slightly, does the loss go up or down, and by how much?"
