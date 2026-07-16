@@ -187,12 +187,9 @@ class IncrementalLightGCN(LightGCN):
     ):
         """
         Run a fixed n_epochs BPR gradient steps on new interactions only,
-        warm-started from existing embeddings — much cheaper than full
-        retraining. One rejection-sampled negative per positive (see
-        _sample_negatives), matching RecBole's default sample_num=1 and the
-        LightGCN paper's standard BPR formulation. No early stopping — every
-        update runs exactly n_epochs, so the energy cost per update is fixed
-        and predictable.
+        warm-started from existing embeddings
+        One rejection-sampled negative per positive
+        No early stopping
         """
 
         # before updating the model mode is set to training mode. this is not neccesary for lightgcn

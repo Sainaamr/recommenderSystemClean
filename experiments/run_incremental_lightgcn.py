@@ -93,24 +93,25 @@ cfg: dataset configuration
 
 def train_historical(cfg: dict) -> tuple[str, float]:
     """
-    Train LightGCN on historical dataset. Returns (checkpoint_path, training_energy_uwh).
+    Train LightGCN on historical dataset. Returns (checkpoint_path, training_emissions_mg).
 
-    Training energy is measured with codecarbon and saved to a sidecar
+    Training emissions are measured with codecarbon and saved to a sidecar
     "<checkpoint>.energy.json" file next to the checkpoint, so the one-time
     training cost survives across runs that later reuse the checkpoint
-    (in that case training_energy_uwh is read back from the sidecar, or 0.0
-    if no sidecar exists — e.g. a checkpoint trained before this was added).
+    (in that case training_emissions_mg is read back from the sidecar, or
+    0.0 if no sidecar exists — e.g. a checkpoint trained before this was
+    added).
     """
     # If a specific checkpoint is configured, use it directly
     if cfg["checkpoint"] and Path(cfg["checkpoint"]).exists():
         print(f"Found existing checkpoint: {cfg['checkpoint']}")
         energy_file = Path(cfg["checkpoint"]).with_suffix(".energy.json")
         if energy_file.exists():
-            training_energy_uwh = json.loads(energy_file.read_text())["training_energy_uwh"]
+            training_emissions_mg = json.loads(energy_file.read_text())["training_emissions_mg"]
         else:
-            print("  (no energy sidecar found — historical training energy unknown for this checkpoint)")
-            training_energy_uwh = 0.0
-        return cfg["checkpoint"], training_energy_uwh
+            print("  (no emissions sidecar found — historical training emissions unknown for this checkpoint)")
+            training_emissions_mg = 0.0
+        return cfg["checkpoint"], training_emissions_mg
 
     print(f"Training LightGCN on {cfg['dataset']}...")
     tracker = EmissionsTracker(
@@ -125,18 +126,22 @@ def train_historical(cfg: dict) -> tuple[str, float]:
         dataset=cfg["dataset"],
         config_file_list=cfg["config_files"],
     )
-    kwh = tracker.stop() or 0.0
-    training_energy_uwh = kwh * 1e6
-    print(f"  Historical training energy: {training_energy_uwh:.4f} µWh")
+    # tracker.stop() returns CO2 emissions in kg (codecarbon's own
+    # EmissionsTracker.stop() docstring: "return: CO2 emissions in kgs"),
+    # not energy — the *1e6 here converts kg to mg (same multiplication as
+    # before, just correctly labeled now instead of being called "µWh").
+    kg_co2 = tracker.stop() or 0.0
+    training_emissions_mg = kg_co2 * 1e6
+    print(f"  Historical training emissions: {training_emissions_mg:.4f} mg CO2eq")
 
     checkpoints = sorted(glob.glob("saved/LightGCN-*.pth"))
     assert checkpoints, "No LightGCN checkpoint found after training"
     checkpoint_path = checkpoints[-1]
 
     energy_file = Path(checkpoint_path).with_suffix(".energy.json")
-    energy_file.write_text(json.dumps({"training_energy_uwh": training_energy_uwh}))
+    energy_file.write_text(json.dumps({"training_emissions_mg": training_emissions_mg}))
 
-    return checkpoint_path, training_energy_uwh
+    return checkpoint_path, training_emissions_mg
 
 
 # Step 2: Load model and ID mappings
@@ -341,7 +346,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                  "recall@20": 0.0, "precision@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
         recall = m["recall@10"]
 
-        update_energy_uwh = 0.0
+        update_emissions_mg = 0.0
         updated = False
 
         if strategy == "incremental":
@@ -364,8 +369,10 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                 tracker.start()
                 model.add_interactions(new_users, new_items)
                 model.incremental_update(new_users, new_items, n_epochs=UPDATE_EPOCHS)
-                kwh = tracker.stop() or 0.0
-                update_energy_uwh = kwh * 1e6
+                # tracker.stop() returns CO2 emissions in kg, not energy;
+                # *1e6 converts kg to mg (see train_historical for details).
+                kg_co2 = tracker.stop() or 0.0
+                update_emissions_mg = kg_co2 * 1e6
                 updated = True
 
                 # Clear buffer after update
@@ -389,8 +396,10 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                 )
                 tracker.start()
                 run_recbole(model="LightGCN", dataset=combined_name, config_file_list=cfg["config_files"])
-                kwh = tracker.stop() or 0.0
-                update_energy_uwh = kwh * 1e6
+                # tracker.stop() returns CO2 emissions in kg, not energy;
+                # *1e6 converts kg to mg (see train_historical for details).
+                kg_co2 = tracker.stop() or 0.0
+                update_emissions_mg = kg_co2 * 1e6
 
                 checkpoints = sorted(glob.glob("saved/LightGCN-*.pth"))
                 assert checkpoints, "No LightGCN checkpoint found after full retrain"
@@ -431,22 +440,22 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             "ndcg_at_20":        m["ndcg@20"],
             "hr_at_20":          m["hr@20"],
             "mrr":               m["mrr"],
-            "update_energy_uwh": update_energy_uwh,
+            "update_emissions_mg": update_emissions_mg,
             "updated":           updated,
         })
 
         if (i + 1) % 20 == 0 or updated:
             print(f"  Batch {i+1:>3}/{n_batches}  Recall@10={recall:.4f}"
-                  + (f"  ← updated ({update_energy_uwh:.4f} µWh)" if updated else ""))
+                  + (f"  ← updated ({update_emissions_mg:.4f} mg CO2eq)" if updated else ""))
 
     return pd.DataFrame(records)
 
 
 # Step 6: Plot results
 
-def plot_results(df: pd.DataFrame, cfg: dict, training_energy_uwh: float = None):
+def plot_results(df: pd.DataFrame, cfg: dict, training_emissions_mg: float = None):
     plot_streaming_results(df, cfg["results_png"], cfg["plot_title"], UPDATE_EVERY,
-                           training_energy_uwh=training_energy_uwh)
+                           training_emissions_mg=training_emissions_mg)
 
 
 # Main
@@ -490,7 +499,7 @@ def main():
     print(f"Run timestamp: {ts}")
 
     # Step 1: Train or load checkpoint
-    checkpoint, training_energy_uwh = train_historical(cfg)
+    checkpoint, training_emissions_mg = train_historical(cfg)
 
     # Step 2: Run each requested strategy, each starting from a fresh copy
     # of the same historical checkpoint (so strategies are directly
@@ -511,28 +520,28 @@ def main():
     results.to_csv(cfg["results_csv"], index=False)
     print(f"\nResults saved → {cfg['results_csv']}")
 
-    # Historical training energy is only otherwise persisted in the
+    # Historical training emissions are only otherwise persisted in the
     # gitignored saved/*.energy.json sidecar — mirror it into results/
     # (git-tracked) so it survives independently of the checkpoint.
     energy_summary_path = Path(str(cfg["results_csv"]).replace(".csv", "_training_energy.json"))
-    energy_summary_path.write_text(json.dumps({"training_energy_uwh": training_energy_uwh}))
-    print(f"Training energy saved → {energy_summary_path}")
+    energy_summary_path.write_text(json.dumps({"training_emissions_mg": training_emissions_mg}))
+    print(f"Training emissions saved → {energy_summary_path}")
 
-    plot_results(results, cfg, training_energy_uwh=training_energy_uwh)
+    plot_results(results, cfg, training_emissions_mg=training_emissions_mg)
 
     # Summary
     print("\n── Summary ──────────────────────────────────────────────")
-    print(f"  Historical training energy:  {training_energy_uwh:.4f} µWh")
+    print(f"  Historical training emissions:  {training_emissions_mg:.4f} mg CO2eq")
     for strategy, df in dfs.items():
         avg_recall = df["recall_at_10"].mean()
         print(f"  Avg Recall@10 ({strategy}): {avg_recall:.4f}")
         if strategy == "no_update":
             continue
-        total_energy = df["update_energy_uwh"].sum()
+        total_emissions = df["update_emissions_mg"].sum()
         n_updates    = int(df["updated"].sum())
-        print(f"  Total {strategy} energy:      {total_energy:.4f} µWh")
+        print(f"  Total {strategy} emissions:      {total_emissions:.4f} mg CO2eq")
         print(f"  Number of {strategy} updates: {n_updates}")
-        print(f"  Avg energy per update:       {total_energy / max(n_updates, 1):.4f} µWh")
+        print(f"  Avg emissions per update:       {total_emissions / max(n_updates, 1):.4f} mg CO2eq")
 
 
 if __name__ == "__main__":

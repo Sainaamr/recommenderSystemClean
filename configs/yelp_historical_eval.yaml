@@ -1,16 +1,20 @@
 # Evaluation config for Yelp historical training only.
 # Real test set is yelp-realtime — no test split needed here.
 #
-# mode: uni100 instead of full — "full" ranks all 38k items for all 60k users
-# (2.3 billion pairs) after every epoch and at final evaluation, which takes
-# hours on CPU. uni100 samples 100 negatives per user, which is fast and
-# sufficient for early stopping signal. Final accuracy numbers come from
-# the realtime streaming evaluation, not this internal split.
+# mode: full — despite the name, this is the FASTER option in practice here,
+# not uni100. uni100 requires per-user negative sampling for ~60k users,
+# and RecBole's sampler implements that with a plain Python loop
+# (recbole/sampler/sampler.py, sample_by_key_ids), not a vectorized
+# operation — millions of scalar Python-level checks, which is dramatically
+# slower in wall-clock time than one vectorized full-catalog matrix multiply,
+# confirmed empirically: uni100 measured at ~5.6 hours/epoch eval vs full's
+# ~30 seconds/epoch eval, same data/hardware. Do not switch this back to
+# uni100 without re-verifying the sampler performance first.
 eval_args:
   split: {RS: [0.8, 0.1, 0.1]}   # internal split for early stopping only
   group_by: user
   order: TO
-  mode: uni100
+  mode: full
 
 metrics: [Recall, NDCG]
 topk: [10]

@@ -55,15 +55,15 @@ def main():
             print(f"  WARNING: strategy/strategies {sorted(overlap)} appear in more than one "
                   f"input file — combined CSV will contain duplicate rows for them.")
 
-    training_energy_uwh = None
+    training_emissions_mg = None
     for path in args.results_csv:
         energy_path = Path(str(path).replace(".csv", "_training_energy.json"))
         if energy_path.exists():
-            training_energy_uwh = json.loads(energy_path.read_text())["training_energy_uwh"]
+            training_emissions_mg = json.loads(energy_path.read_text())["training_emissions_mg"]
             break
-    if training_energy_uwh is None:
-        print("  (no training-energy sidecar found in any input file — "
-              "energy plot will have no historical-training reference line)")
+    if training_emissions_mg is None:
+        print("  (no training-emissions sidecar found in any input file — "
+              "emissions plot will have no historical-training reference line)")
 
     if len(dfs) == 1:
         # Single file: just regenerate its own plot in place, no new CSV.
@@ -79,7 +79,7 @@ def main():
               f"(strategies: {sorted(combined['strategy'].unique())})")
 
     plot_streaming_results(combined, out_png, DATASET_CONFIGS[args.dataset]["plot_title"], UPDATE_EVERY,
-                           training_energy_uwh=training_energy_uwh)
+                           training_emissions_mg=training_emissions_mg)
 
 
 if __name__ == "__main__":

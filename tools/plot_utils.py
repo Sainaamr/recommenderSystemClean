@@ -18,21 +18,26 @@ COLORS = {
     "hybrid":               "#457b9d",
     "itemknn_static":       "#e63946",
     "lgcn_itemknn":         "#f4a261",
-    "energy":               "#e63946",
-    "energy_per":           "#e9c46a",
 }
 SMOOTH = 30   # rolling average window for recall lines
 DPI    = 150
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def style_ax(ax, xlabel=None, ylabel=None, title=None):
+def style_ax(ax, xlabel=None, ylabel=None, title=None, log_y=False):
     """Apply common axis styling."""
     if xlabel: ax.set_xlabel(xlabel)
     if ylabel: ax.set_ylabel(ylabel)
     if title:  ax.set_title(title)
     ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
+    # log_y: for plots mixing a one-time cost with many much-smaller
+    # per-update costs (e.g. energy bars) — a linear axis sized to fit the
+    # larger one makes the smaller bars round to invisible pixels. Log
+    # scale can't include 0, so skip the bottom=0 clamp in that case.
+    if log_y:
+        ax.set_yscale("log")
+    else:
+        ax.set_ylim(bottom=0)
     ax.legend()
     ax.grid(alpha=0.3)
 
@@ -103,44 +108,40 @@ def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
     ax.legend(loc="upper left", frameon=True)
 
 
-def plot_recall_over_time(ax, df: pd.DataFrame, update_every: int):
-    """Backwards-compatible wrapper — plots recall_at_10."""
-    plot_metric_over_time(ax, df, update_every, metric="recall_at_10")
-
-
 def plot_energy_bars(ax, df: pd.DataFrame, bar_width: int = 800,
-                     training_energy_uwh: float = None):
-    """Plot energy cost per update as bars (incremental + full_retrain,
+                     training_emissions_mg: float = None):
+    """Plot CO2 emissions cost per update as bars (incremental + full_retrain,
     side by side where both occur), plus a reference line for the
-    one-time historical training energy (if provided)."""
+    one-time historical training emissions (if provided)."""
     inc_updates = df[(df["strategy"] == "incremental") & (df["updated"])]
     retrain_updates = df[(df["strategy"] == "full_retrain") & (df["updated"])]
 
     has_both = len(inc_updates) and len(retrain_updates)
     offset = bar_width * 0.55 if has_both else 0
     if len(inc_updates):
-        ax.bar(inc_updates["interactions"] - offset, inc_updates["update_energy_uwh"],
+        ax.bar(inc_updates["interactions"] - offset, inc_updates["update_emissions_mg"],
                width=bar_width, color=COLORS["incremental"], alpha=0.7,
-               label="Incremental update energy")
+               label="Incremental update emissions")
     if len(retrain_updates):
-        ax.bar(retrain_updates["interactions"] + offset, retrain_updates["update_energy_uwh"],
+        ax.bar(retrain_updates["interactions"] + offset, retrain_updates["update_emissions_mg"],
                width=bar_width, color=COLORS["hybrid"], alpha=0.7,
-               label="Full retrain energy")
-    if training_energy_uwh is not None:
-        ax.axhline(training_energy_uwh, color=COLORS["no_update"],
+               label="Full retrain emissions")
+    if training_emissions_mg is not None:
+        ax.axhline(training_emissions_mg, color=COLORS["no_update"],
                    linewidth=1.5, linestyle="--",
-                   label=f"Historical training energy (one-time, {training_energy_uwh:.2f} µWh)")
+                   label=f"Historical training emissions (one-time, {training_emissions_mg:.2f} mg CO2eq)")
     style_ax(ax,
              xlabel="Interactions seen (real-time stream)",
-             ylabel="Update energy (µWh)",
-             title="Energy Cost per Update")
+             ylabel="Update emissions (mg CO2eq, log scale)",
+             title="Emissions Cost per Update",
+             log_y=True)
 
 
 def plot_streaming_results(df: pd.DataFrame, out_path: Path,
                            title: str, update_every: int,
-                           training_energy_uwh: float = None):
+                           training_emissions_mg: float = None):
     """
-    One PNG per available metric + one energy PNG.
+    One PNG per available metric + one emissions PNG.
     out_path is used as base — metric name suffix added per file.
     """
     base = Path(str(out_path).replace(".png", ""))
@@ -157,81 +158,12 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
         print(f"Plot saved → {path}")
         plt.close()
 
-    # Energy plot
+    # Emissions plot
     fig, ax = plt.subplots(figsize=(12, 4))
     fig.suptitle(title, fontsize=13)
-    plot_energy_bars(ax, df, training_energy_uwh=training_energy_uwh)
+    plot_energy_bars(ax, df, training_emissions_mg=training_emissions_mg)
     plt.tight_layout()
     energy_path = Path(f"{base}_energy.png")
     plt.savefig(energy_path, dpi=DPI)
     print(f"Plot saved → {energy_path}")
-    plt.close()
-
-
-def plot_update_freq_recall_curves(df: pd.DataFrame, out_path: Path, title: str):
-    """
-    Smoothed Recall@10 over time for each UPDATE_EVERY value.
-    update_every=0 is the no_update baseline, shown as a dashed red line.
-    Fixed BATCH_SIZE means all curves share the same x-axis density.
-    """
-    fig, ax = plt.subplots(figsize=(12, 6))
-    cmap = plt.cm.viridis
-
-    # No-update baseline (update_every=0)
-    if 0 in df["update_every"].values:
-        grp = df[df["update_every"] == 0]
-        smoothed = grp["recall_at_10"].rolling(SMOOTH, min_periods=1, center=True).mean()
-        ax.plot(grp["interactions"], grp["recall_at_10"],
-                color=COLORS["no_update"], alpha=0.15, linewidth=0.8)
-        ax.plot(grp["interactions"], smoothed,
-                color=COLORS["no_update"], linewidth=2.0, linestyle="--",
-                label="No update (baseline)")
-
-    incremental_values = sorted(v for v in df["update_every"].unique() if v != 0)
-    colors = [cmap(i / max(len(incremental_values) - 1, 1))
-              for i in range(len(incremental_values))]
-
-    for ue, color in zip(incremental_values, colors):
-        grp = df[df["update_every"] == ue]
-        raw = grp["recall_at_10"]
-        smoothed = raw.rolling(SMOOTH, min_periods=1, center=True).mean()
-        ax.plot(grp["interactions"], raw, color=color, alpha=0.15, linewidth=0.8)
-        ax.plot(grp["interactions"], smoothed, color=color, linewidth=2.0,
-                label=f"update_every={ue} ({ue*1000:,} inter/upd)")
-
-    style_ax(ax, xlabel="Interactions seen (real-time stream)",
-             ylabel="Recall@10", title=title)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=DPI)
-    print(f"Plot saved → {out_path}")
-    plt.close()
-
-
-def plot_update_freq_ablation(summary: pd.DataFrame, out_path: Path, title: str):
-    """
-    Three-panel plot: quality / total energy / energy-per-update vs interactions_per_update.
-    Used by find_optimal_batch_size.py.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle(title, fontsize=13)
-
-    x_labels = summary["interactions_per_update"].astype(int).astype(str)
-
-    axes[0].plot(summary["interactions_per_update"], summary["avg_recall"],
-                 marker="o", color=COLORS["incremental"], linewidth=2)
-    style_ax(axes[0], xlabel="Interactions per update", ylabel="Avg Recall@10",
-             title="Quality vs Update Frequency")
-
-    axes[1].bar(x_labels, summary["total_energy"], color=COLORS["energy"], alpha=0.7)
-    style_ax(axes[1], xlabel="Interactions per update",
-             ylabel="Total update energy (µWh)", title="Total Energy vs Update Frequency")
-
-    axes[2].bar(x_labels, summary["energy_per_update"],
-                color=COLORS["energy_per"], alpha=0.7)
-    style_ax(axes[2], xlabel="Interactions per update",
-             ylabel="Avg energy per update (µWh)", title="Energy per Update vs Update Frequency")
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=DPI)
-    print(f"Plot saved → {out_path}")
     plt.close()
