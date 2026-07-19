@@ -167,3 +167,79 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
     plt.savefig(energy_path, dpi=DPI)
     print(f"Plot saved → {energy_path}")
     plt.close()
+
+
+def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
+                           batch_size: int = 1000, smooth: int = 20):
+    """
+    One PNG per metric (recall/precision/ndcg @10 — each showing existing vs
+    new vs overall users, with % new users on a secondary axis), plus one
+    separate PNG for new user arrivals per batch.
+    """
+    base = Path(str(out_path).replace(".png", ""))
+    x = df["interactions"]
+
+    def smoothed(col):
+        return df[col].rolling(smooth, min_periods=1, center=True).mean()
+
+    group_colors = {
+        "existing": "#2a9d8f",
+        "new_user": "#e63946",
+        "overall":  "#457b9d",
+    }
+    group_labels = {
+        "existing": "Existing users",
+        "new_user": "New users — mean emb",
+        "overall":  "Overall",
+    }
+    metrics = [("recall", "Recall@10"), ("precision", "Precision@10"), ("ndcg", "NDCG@10")]
+
+    for metric, label in metrics:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        fig.suptitle(title, fontsize=13)
+
+        for group, color in group_colors.items():
+            col = f"{metric}_{group}"
+            ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
+            ax.plot(x, smoothed(col), color=color, linewidth=2,
+                    label=f"{group_labels[group]} (smoothed)")
+
+        ax.set_ylabel(label)
+        ax.set_title(f"{label} by User Group Over Time")
+
+        # pct_new_user on right axis
+        ax2 = ax.twinx()
+        ax2.plot(x, df["pct_new_user"], color="#6a4c93", alpha=0.2, linewidth=0.8)
+        ax2.plot(x, smoothed("pct_new_user"), color="#6a4c93", linewidth=1.5,
+                 linestyle="--", label="% new users (right axis)")
+        ax2.set_ylabel("Fraction of unique users that are new", color="#6a4c93")
+        ax2.tick_params(axis="y", labelcolor="#6a4c93")
+        ax2.set_ylim(0, 1)
+
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+
+        plt.tight_layout()
+        path = Path(f"{base}_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
+
+    # New user arrivals per batch — its own separate plot
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.suptitle(title, fontsize=13)
+    ax.bar(x, df["n_new_users"], width=batch_size * 0.8,
+           color="#e63946", alpha=0.4, label="New users per batch")
+    ax.plot(x, smoothed("n_new_users"), color="#e63946", linewidth=2,
+            label="Smoothed arrival rate")
+    ax.set_ylabel("Unique new users")
+    ax.set_xlabel("Interactions seen")
+    ax.set_title("New User Arrivals per Batch")
+    ax.legend()
+
+    plt.tight_layout()
+    arrivals_path = Path(f"{base}_new_user_arrivals.png")
+    plt.savefig(arrivals_path, dpi=DPI)
+    print(f"Plot saved → {arrivals_path}")
+    plt.close()
