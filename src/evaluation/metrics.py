@@ -66,7 +66,7 @@ def _avg(results):
     return {m: float(np.mean([r[m] for r in results])) for m in results[0]}
 
 
-def batch_metrics_lgcn(model, user_ids, item_ids, user_history, k=10, ks=(10, 20)):
+def batch_metrics_lgcn(model, user_ids, item_ids, user_history, ks=(10, 20)):
     """Compute averaged metrics for a batch using a LightGCN model."""
     import torch
     model.eval()
