@@ -42,12 +42,11 @@ from tools.plot_utils import plot_new_user_analysis
 
 def score_batch(lgcn, existing_gt, new_user_gt, history, k=10):
     """
-    Single forward pass. Scores an already-split existing/new_user ground
-    truth dict pair separately. Returns (metrics_existing, metrics_new_user,
-    metrics_overall) — same shape batch_metrics_lgcn returns, just computed
-    separately per group instead of for everyone combined. Classifying which
-    uid is "existing" vs "new" is the caller's job (run_new_user_analysis) —
-    this function only scores whatever split it's handed.
+    Single forward pass.
+    Scores an already-split existing/new_user ground
+    truth dict pair separately.
+     Returns (metrics_existing, metrics_new_user,
+    metrics_overall)
     """
     lgcn.eval()
     with torch.no_grad():
@@ -74,7 +73,7 @@ def score_batch(lgcn, existing_gt, new_user_gt, history, k=10):
     )
 
 
-#Streaming loop
+# Streaming loop
 
 def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
     user2id, item2id, config, dataset = load_id_mappings(cfg)
@@ -168,6 +167,7 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
             "ndcg_overall":       m_overall["ndcg@10"],
             "pct_new_user":       pct_new_user,
             "n_new_users":        n_new_users,
+            "n_users_trained":    n_users_trained,
         })
 
         if (i + 1) % 20 == 0:
@@ -181,7 +181,7 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
 
 def main():
     parser = argparse.ArgumentParser()

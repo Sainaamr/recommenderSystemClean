@@ -173,8 +173,8 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
                            batch_size: int = 1000, smooth: int = 20):
     """
     One PNG per metric (recall/precision/ndcg @10 — each showing existing vs
-    new vs overall users, with % new users on a secondary axis), plus one
-    separate PNG for new user arrivals per batch.
+    new vs overall users), plus one PNG for new user arrivals per batch, plus
+    one PNG for cumulative total population growth over time.
     """
     base = Path(str(out_path).replace(".png", ""))
     x = df["interactions"]
@@ -206,19 +206,9 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
 
         ax.set_ylabel(label)
         ax.set_title(f"{label} by User Group Over Time")
-
-        # pct_new_user on right axis
-        ax2 = ax.twinx()
-        ax2.plot(x, df["pct_new_user"], color="#6a4c93", alpha=0.2, linewidth=0.8)
-        ax2.plot(x, smoothed("pct_new_user"), color="#6a4c93", linewidth=1.5,
-                 linestyle="--", label="% new users (right axis)")
-        ax2.set_ylabel("Fraction of unique users that are new", color="#6a4c93")
-        ax2.tick_params(axis="y", labelcolor="#6a4c93")
-        ax2.set_ylim(0, 1)
-
-        lines1, labels1 = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        ax.legend(loc="upper right")
 
         plt.tight_layout()
         path = Path(f"{base}_{metric}.png")
@@ -231,15 +221,40 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
     fig.suptitle(title, fontsize=13)
     ax.bar(x, df["n_new_users"], width=batch_size * 0.8,
            color="#e63946", alpha=0.4, label="New users per batch")
-    ax.plot(x, smoothed("n_new_users"), color="#e63946", linewidth=2,
-            label="Smoothed arrival rate")
     ax.set_ylabel("Unique new users")
     ax.set_xlabel("Interactions seen")
     ax.set_title("New User Arrivals per Batch")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
     ax.legend()
 
     plt.tight_layout()
     arrivals_path = Path(f"{base}_new_user_arrivals.png")
     plt.savefig(arrivals_path, dpi=DPI)
     print(f"Plot saved → {arrivals_path}")
+    plt.close()
+
+    # Total population growth: historical baseline + cumulative new users seen so far
+    total_population = df["n_users_trained"].iloc[0] + df["n_new_users"].cumsum()
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.suptitle(title, fontsize=13)
+    ax.plot(x, total_population, color="#457b9d", linewidth=2,
+            label="Total distinct users seen (historical + new)")
+    ax.axhline(df["n_users_trained"].iloc[0], color="#2a9d8f", linewidth=1.5,
+               linestyle="--", label="Historical baseline")
+    ax.set_ylabel("Total distinct users")
+    ax.set_xlabel("Interactions seen")
+    ax.set_title("Population Growth Over Time")
+    ax.set_xlim(left=0)
+    # No ylim(bottom=0) here deliberately — the population only ever grows by
+    # a small fraction of its starting size (e.g. ml-1m: 6022 -> ~6034), so
+    # forcing the axis down to 0 would squeeze all the actual variation into
+    # a sliver at the top of the chart. Let matplotlib auto-scale to the
+    # data's real range instead.
+    ax.legend()
+
+    plt.tight_layout()
+    growth_path = Path(f"{base}_population_growth.png")
+    plt.savefig(growth_path, dpi=DPI)
+    print(f"Plot saved → {growth_path}")
     plt.close()
