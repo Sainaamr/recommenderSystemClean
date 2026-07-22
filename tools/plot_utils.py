@@ -169,6 +169,63 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
     plt.close()
 
 
+def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
+                            batch_size: int = 1000):
+    """
+    New user arrivals per batch — shared by plot_new_user_analysis and
+    plot_content_coldstart, both of which track the same n_new_users column.
+    """
+    x = df["interactions"]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.suptitle(title, fontsize=13)
+    ax.bar(x, df["n_new_users"], width=batch_size * 0.8,
+           color="#e63946", alpha=0.4, label="New users per batch")
+    ax.set_ylabel("Unique new users")
+    ax.set_xlabel("Interactions seen")
+    ax.set_title("New User Arrivals per Batch")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.legend()
+
+    plt.tight_layout()
+    arrivals_path = Path(f"{base}_new_user_arrivals.png")
+    plt.savefig(arrivals_path, dpi=DPI)
+    print(f"Plot saved → {arrivals_path}")
+    plt.close()
+
+
+def _plot_population_growth(df: pd.DataFrame, base: Path, title: str):
+    """
+    Cumulative total population (historical baseline + new users seen so
+    far) — shared by plot_new_user_analysis and plot_content_coldstart, both
+    of which track n_users_trained/n_new_users.
+    """
+    x = df["interactions"]
+    total_population = df["n_users_trained"].iloc[0] + df["n_new_users"].cumsum()
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.suptitle(title, fontsize=13)
+    ax.plot(x, total_population, color="#457b9d", linewidth=2,
+            label="Total distinct users seen (historical + new)")
+    ax.axhline(df["n_users_trained"].iloc[0], color="#2a9d8f", linewidth=1.5,
+               linestyle="--", label="Historical baseline")
+    ax.set_ylabel("Total distinct users")
+    ax.set_xlabel("Interactions seen")
+    ax.set_title("Population Growth Over Time")
+    ax.set_xlim(left=0)
+    # No ylim(bottom=0) here deliberately — the population only ever grows by
+    # a small fraction of its starting size (e.g. ml-1m: 6022 -> ~6034), so
+    # forcing the axis down to 0 would squeeze all the actual variation into
+    # a sliver at the top of the chart. Let matplotlib auto-scale to the
+    # data's real range instead.
+    ax.legend()
+
+    plt.tight_layout()
+    growth_path = Path(f"{base}_population_growth.png")
+    plt.savefig(growth_path, dpi=DPI)
+    print(f"Plot saved → {growth_path}")
+    plt.close()
+
+
 def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
                            batch_size: int = 1000, smooth: int = 20):
     """
@@ -216,45 +273,66 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
         print(f"Plot saved → {path}")
         plt.close()
 
-    # New user arrivals per batch — its own separate plot
+    _plot_new_user_arrivals(df, base, title, batch_size=batch_size)
+    _plot_population_growth(df, base, title)
+
+
+def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
+                           batch_size: int = 1000, smooth: int = 20):
+    """
+    One PNG comparing new-user recall under mean-init vs content-init, one
+    PNG comparing overall recall (existing / overall-mean / overall-content),
+    plus the same shared new-user-arrivals and population-growth PNGs used
+    by plot_new_user_analysis.
+    """
+    base = Path(str(out_path).replace(".png", ""))
+    x = df["interactions"]
+
+    def smoothed(col):
+        return df[col].rolling(smooth, min_periods=1, center=True).mean()
+
+    # ── New user recall: mean vs content init ────────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     fig.suptitle(title, fontsize=13)
-    ax.bar(x, df["n_new_users"], width=batch_size * 0.8,
-           color="#e63946", alpha=0.4, label="New users per batch")
-    ax.set_ylabel("Unique new users")
+    for col, color, label in [
+        ("recall_new_mean",    "#e63946", "New users — mean init"),
+        ("recall_new_content", "#2a9d8f", "New users — content init"),
+    ]:
+        ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
+        ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
+    ax.set_ylabel("Recall@10")
     ax.set_xlabel("Interactions seen")
-    ax.set_title("New User Arrivals per Batch")
+    ax.set_title("New User Recall: Mean Init vs Content-Aware Init")
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
-    ax.legend()
-
+    ax.legend(loc="upper right")
     plt.tight_layout()
-    arrivals_path = Path(f"{base}_new_user_arrivals.png")
-    plt.savefig(arrivals_path, dpi=DPI)
-    print(f"Plot saved → {arrivals_path}")
+    path = Path(f"{base}_new_user_recall.png")
+    plt.savefig(path, dpi=DPI)
+    print(f"Plot saved → {path}")
     plt.close()
 
-    # Total population growth: historical baseline + cumulative new users seen so far
-    total_population = df["n_users_trained"].iloc[0] + df["n_new_users"].cumsum()
+    # ── Overall recall comparison ────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     fig.suptitle(title, fontsize=13)
-    ax.plot(x, total_population, color="#457b9d", linewidth=2,
-            label="Total distinct users seen (historical + new)")
-    ax.axhline(df["n_users_trained"].iloc[0], color="#2a9d8f", linewidth=1.5,
-               linestyle="--", label="Historical baseline")
-    ax.set_ylabel("Total distinct users")
+    for col, color, label in [
+        ("recall_existing",        "#457b9d", "Existing users"),
+        ("recall_overall_mean",    "#e63946", "Overall — mean init"),
+        ("recall_overall_content", "#2a9d8f", "Overall — content init"),
+    ]:
+        ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
+        ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
+    ax.set_ylabel("Recall@10")
     ax.set_xlabel("Interactions seen")
-    ax.set_title("Population Growth Over Time")
+    ax.set_title("Overall Recall Comparison")
     ax.set_xlim(left=0)
-    # No ylim(bottom=0) here deliberately — the population only ever grows by
-    # a small fraction of its starting size (e.g. ml-1m: 6022 -> ~6034), so
-    # forcing the axis down to 0 would squeeze all the actual variation into
-    # a sliver at the top of the chart. Let matplotlib auto-scale to the
-    # data's real range instead.
-    ax.legend()
-
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="upper right")
     plt.tight_layout()
-    growth_path = Path(f"{base}_population_growth.png")
-    plt.savefig(growth_path, dpi=DPI)
-    print(f"Plot saved → {growth_path}")
+    path = Path(f"{base}_overall_recall.png")
+    plt.savefig(path, dpi=DPI)
+    print(f"Plot saved → {path}")
     plt.close()
+
+    _plot_new_user_arrivals(df, base, title, batch_size=batch_size)
+    _plot_population_growth(df, base, title)

@@ -49,7 +49,6 @@ from tools.plot_utils import plot_streaming_results
 BATCH_SIZE    = 1000
 UPDATE_EVERY  = 20    # run incremental_update every N batches
 UPDATE_EPOCHS = 30    # fixed gradient steps per incremental update, no early stopping
-TOP_K         = 10
 RESULTS_DIR   = Path("results")
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -340,7 +339,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
         # Measure metrics before update (reflects current model state, no data leakage)
         if batch_users:
-            m = batch_metrics_lgcn(model, batch_users, batch_items, history, k=TOP_K)
+            m = batch_metrics_lgcn(model, batch_users, batch_items, history)
         else:
             m = {"recall@10": 0.0, "precision@10": 0.0, "ndcg@10": 0.0, "hr@10": 0.0,
                  "recall@20": 0.0, "precision@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
