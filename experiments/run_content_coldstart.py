@@ -222,14 +222,26 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
             history.setdefault(uid, set()).add(iid)
 
         records.append({
-            "batch":                  i + 1,
-            "interactions":           (i + 1) * BATCH_SIZE,
-            "recall_existing":        m_existing["recall@10"],
-            "recall_new_content":     m_new_content["recall@10"],
-            "recall_overall_content": m_overall_content["recall@10"],
-            "n_new_users":            n_new_users,
-            "pct_new_users":          pct_new_users,
-            "n_users_trained":        n_users_trained,
+            "batch":                     i + 1,
+            "interactions":              (i + 1) * BATCH_SIZE,
+            "recall_existing":           m_existing["recall@10"],
+            "precision_existing":        m_existing["precision@10"],
+            "ndcg_existing":             m_existing["ndcg@10"],
+            "hr_existing":               m_existing["hr@10"],
+            "mrr_existing":              m_existing["mrr"],
+            "recall_new_content":        m_new_content["recall@10"],
+            "precision_new_content":     m_new_content["precision@10"],
+            "ndcg_new_content":          m_new_content["ndcg@10"],
+            "hr_new_content":            m_new_content["hr@10"],
+            "mrr_new_content":           m_new_content["mrr"],
+            "recall_overall_content":    m_overall_content["recall@10"],
+            "precision_overall_content": m_overall_content["precision@10"],
+            "ndcg_overall_content":      m_overall_content["ndcg@10"],
+            "hr_overall_content":        m_overall_content["hr@10"],
+            "mrr_overall_content":       m_overall_content["mrr"],
+            "n_new_users":               n_new_users,
+            "pct_new_users":             pct_new_users,
+            "n_users_trained":           n_users_trained,
         })
 
         if (i + 1) % 20 == 0:
@@ -242,18 +254,27 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
 
 def merge_new_user_baseline(df: pd.DataFrame, new_user_csv: Path) -> pd.DataFrame:
     """
-    Merge in the mean-init baseline (recall_new_user -> recall_new_mean,
-    recall_overall -> recall_overall_mean) from a run_new_user_analysis.py
-    results CSV, joined on batch. Both scripts stream the exact same frozen
-    checkpoint over the exact same realtime data with no training and no
-    other randomness, so their existing/new-user classification and mean-init
-    recall numbers are deterministically identical batch-for-batch — this
-    reuses that output instead of recomputing it.
+    Merge in the mean-init baseline (recall/precision/ndcg for new users and
+    overall) from a run_new_user_analysis.py results CSV, joined on batch.
+    Both scripts stream the exact same frozen checkpoint over the exact same
+    realtime data with no training and no other randomness, so their
+    existing/new-user classification and mean-init numbers are
+    deterministically identical batch-for-batch — this reuses that output
+    instead of recomputing it. run_new_user_analysis.py doesn't compute
+    hr/mrr, so those have no mean-init counterpart to merge in.
     """
-    baseline = pd.read_csv(new_user_csv)[["batch", "recall_new_user", "recall_overall"]]
+    baseline = pd.read_csv(new_user_csv)[[
+        "batch",
+        "recall_new_user", "precision_new_user", "ndcg_new_user",
+        "recall_overall", "precision_overall", "ndcg_overall",
+    ]]
     baseline = baseline.rename(columns={
-        "recall_new_user": "recall_new_mean",
-        "recall_overall":  "recall_overall_mean",
+        "recall_new_user":    "recall_new_mean",
+        "precision_new_user": "precision_new_mean",
+        "ndcg_new_user":      "ndcg_new_mean",
+        "recall_overall":     "recall_overall_mean",
+        "precision_overall":  "precision_overall_mean",
+        "ndcg_overall":       "ndcg_overall_mean",
     })
     return df.merge(baseline, on="batch", how="left")
 
