@@ -7,23 +7,24 @@ similar trained users, then returns a weighted average of their frozen
 LightGCN embeddings as the new user's cold-start embedding.
 
 Location is the primary signal (alpha=0.7), categories are secondary.
-Geographic sections use lat/lon binning at 0.5-degree resolution (~50km).
+Geographic sections use geohash encoding at 4-character precision (~39km x
+19.5km cells).
 
 Standalone — does not modify any existing model or experiment file.
 """
 
+import pickle
 import numpy as np
 import pandas as pd
+import pygeohash as pgh
 
 """
 lat: latitude
-lon: longitude  
-precision: 50km resolution
-Buckets a precise location into a coarser gride cell
-the "grid mapper" approach
+lon: longitude
+precision: geohash string length (4 chars ~= 39km x 19.5km)
 """
-def _geo_bin(lat: float, lon: float, precision: float = 0.5):
-    return (round(lat / precision) * precision, round(lon / precision) * precision)
+def _geo_bin(lat: float, lon: float, precision: int = 4):
+    return pgh.encode(lat, lon, precision=precision)
 
 """
 clean up the raw category of an item and turn it into a clean set
@@ -43,17 +44,15 @@ class ContentUserInitializer:
     """
 
     def __init__(self, alpha: float = 0.7, top_k: int = 20,
-                 geo_precision: float = 0.5):
+                 geo_precision: int = 4):
         self.alpha         = alpha # ensures locations is more significant than catalogue
         self.top_k         = top_k # how many of the most similar trained users to average together
-        self.geo_precision = geo_precision # grid-cell size
-        self._item_geo      = {}   # iid → geo_bin tuple (trained items only)
+        self.geo_precision = geo_precision # geohash string length
+        self._item_geo      = {}   # iid → geohash string (trained items only)
         self._item_cats     = {}   # iid → set of category strings (trained items only)
         self._item_geo_by_token  = {} # raw item token → geo_bin
         self._item_cats_by_token = {}  # raw item token →  category set
         self._user_emb      = None # (n_trained, d) frozen embeddings
-        self._user_geo_freq = {}   # uid → {geo_bin: count} how often user interacted with that geo_bin
-        self._user_cat_freq = {}   # uid → {category: count}
         self._trained_uids  = []   # sorted list of uids that have geo profiles
         self._excluded_user_items = {} # raw user token → list of historical iids
 
@@ -133,15 +132,52 @@ class ContentUserInitializer:
                 cat_counts = user_cat_freq.setdefault(uid, {})
                 cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
-        self._user_geo_freq = user_geo_freq
-        self._user_cat_freq = user_cat_freq
-
         # for debugging and reproducibility reasons
-        self._trained_uids  = sorted(self._user_geo_freq.keys())
+        self._trained_uids  = sorted(user_geo_freq.keys())
+        self._trained_uids_arr = np.array(self._trained_uids)
+
+        # Dense (n_trained_users, n_distinct_bins/cats) matrices, so
+        # get_embedding() can score every trained user with one vectorized
+        # numpy operation instead of a Python loop + dict lookups per user
+        self._geo_bin_list  = sorted({g for freq in user_geo_freq.values() for g in freq})
+        self._geo_bin_index = {g: i for i, g in enumerate(self._geo_bin_list)}
+        self._cat_list      = sorted({c for freq in user_cat_freq.values() for c in freq})
+        self._cat_index     = {c: i for i, c in enumerate(self._cat_list)}
+
+        uid_to_row = {uid: i for i, uid in enumerate(self._trained_uids)}
+        self._geo_matrix = np.zeros((len(self._trained_uids), len(self._geo_bin_list)), dtype=np.float32)
+        self._cat_matrix = np.zeros((len(self._trained_uids), len(self._cat_list)), dtype=np.float32)
+        for uid, freq in user_geo_freq.items():
+            row = uid_to_row[uid]
+            for g, count in freq.items():
+                self._geo_matrix[row, self._geo_bin_index[g]] = count
+        for uid, freq in user_cat_freq.items():
+            row = uid_to_row[uid]
+            for c, count in freq.items():
+                self._cat_matrix[row, self._cat_index[c]] = count
 
         print(f"  ContentUserInit: recovered historical items for "
               f"{len(self._excluded_user_items)} users excluded from training")
         print(f"  ContentUserInit: built profiles for {len(self._trained_uids)} trained users")
+
+    def save(self, path: str):
+        """
+        Persists everything build() computed to a single pickle file, the
+        same role LightGCN's .pth checkpoint plays: a later run can load()
+        this instead of re-parsing yelp.item / the historical interactions
+        file and rebuilding the geo/category matrices from scratch.
+        """
+        with open(path, "wb") as f:
+            pickle.dump(self.__dict__, f)
+        print(f"  ContentUserInit: saved index to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> "ContentUserInitializer":
+        obj = cls.__new__(cls)
+        with open(path, "rb") as f:
+            obj.__dict__.update(pickle.load(f))
+        print(f"  ContentUserInit: loaded cached index from {path}")
+        return obj
 
     def get_excluded_history(self, token: str) -> list:
         """
@@ -190,41 +226,49 @@ class ContentUserInitializer:
         total_geo = max(sum(new_geos.values()), 1)
         total_cat = max(sum(new_cats.values()), 1)
 
-        # Score each trained user: location dominates, categories refine
-        scores = []
-        for uid in self._trained_uids:
-            geo_freq = self._user_geo_freq.get(uid, {})
-            cat_freq = self._user_cat_freq.get(uid, {})
-            # go over every geo bin a new user interacted with
-            # for each geo bin take the min of frequency of interaction of new user and
-            # this trained user and sum it all and normalize it
-            geo_overlap = sum(
-                min(new_geos[g], geo_freq.get(g, 0)) for g in new_geos
-            ) / total_geo
+        # Score every trained user at once, via the dense matrices built in
+        # build(). Slice down to only the columns the new user actually has
+        # (typically a handful, out of up to ~1000+ total) before doing the
+        # min/sum overlap — most columns would contribute 0 anyway (the new
+        # user has no count there), so there's no point computing over them.
+        geo_cols = [self._geo_bin_index[g] for g in new_geos if g in self._geo_bin_index]
+        if geo_cols:
+            sub = self._geo_matrix[:, geo_cols]
+            vec = np.array([new_geos[self._geo_bin_list[c]] for c in geo_cols], dtype=np.float32)
+            geo_overlap_all = np.minimum(vec[None, :], sub).sum(axis=1) / total_geo
+        else:
+            geo_overlap_all = np.zeros(len(self._trained_uids), dtype=np.float32)
 
-            cat_overlap = sum(
-                min(new_cats[c], cat_freq.get(c, 0)) for c in new_cats
-            ) / total_cat
-            # calculate the similarity score as weighted blend of two overlap fractions
-            # since location is more important than catalogy
-            score = self.alpha * geo_overlap + (1.0 - self.alpha) * cat_overlap
-            if score > 0:
-                scores.append((score, uid))
+        cat_cols = [self._cat_index[c] for c in new_cats if c in self._cat_index]
+        if cat_cols:
+            sub = self._cat_matrix[:, cat_cols]
+            vec = np.array([new_cats[self._cat_list[c]] for c in cat_cols], dtype=np.float32)
+            cat_overlap_all = np.minimum(vec[None, :], sub).sum(axis=1) / total_cat
+        else:
+            cat_overlap_all = np.zeros(len(self._trained_uids), dtype=np.float32)
 
-        if not scores:
+        # calculate the similarity score as weighted blend of two overlap fractions
+        # since location is more important than catalogy
+        scores_all = self.alpha * geo_overlap_all + (1.0 - self.alpha) * cat_overlap_all
+
+        mask = scores_all > 0
+        if not mask.any():
             return self._user_emb.mean(axis=0)
-        # sort based on the highest score and retrieve the top trained users
-        scores.sort(reverse=True)
-        top = scores[:self.top_k]
-        # normalizing denominator for weight
-        total_w = sum(s for s, _ in top)
-        # initiate the embedding for new user
-        d   = self._user_emb.shape[1]
-        emb = np.zeros(d, dtype=np.float32)
+        cand_scores = scores_all[mask]
+        cand_uids = self._trained_uids_arr[mask]
 
+        # Replicate the equivalent Python sorted(reverse=True) on (score, uid)
+        # tuples exactly: ties break by DESCENDING uid, not ascending —
+        # np.argsort alone (stable) would keep ties in ascending-uid order
+        # and silently pick a different top-k set whenever ties sit right at
+        # the cutoff, which happens often with this integer-ratio scoring.
+        order = np.lexsort((-cand_uids, -cand_scores))[:self.top_k]
+        top_scores = cand_scores[order]
+        top_uids = cand_uids[order]
+
+        # normalizing denominator for weight
+        total_w = top_scores.sum()
         # weight acts as factor that makes user
         # with higher similarity to the new user more significant
-        for w, uid in top:
-            emb += (w / total_w) * self._user_emb[uid]
-
-        return emb
+        weights = (top_scores / total_w).astype(np.float32)
+        return (weights[:, None] * self._user_emb[top_uids]).sum(axis=0)

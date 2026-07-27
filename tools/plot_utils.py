@@ -280,29 +280,33 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
 def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
                            batch_size: int = 1000, smooth: int = 20):
     """
-    One PNG comparing new-user recall under mean-init vs content-init, one
-    PNG comparing overall recall (existing / overall-mean / overall-content),
-    plus the same shared new-user-arrivals and population-growth PNGs used
-    by plot_new_user_analysis.
+    One PNG comparing new-user recall under content-init (and mean-init too,
+    if recall_new_mean is present — merge it in from a run_new_user_analysis.py
+    CSV via --new-user-csv, since that script already computes the identical
+    mean-init numbers and recomputing them here would be redundant), one PNG
+    comparing overall recall, plus the same shared new-user-arrivals and
+    population-growth PNGs used by plot_new_user_analysis.
     """
     base = Path(str(out_path).replace(".png", ""))
     x = df["interactions"]
+    has_mean_baseline = "recall_new_mean" in df.columns
 
     def smoothed(col):
         return df[col].rolling(smooth, min_periods=1, center=True).mean()
 
-    # ── New user recall: mean vs content init ────────────────────────────────
+    # ── New user recall: content init (+ mean init, if merged in) ───────────
     fig, ax = plt.subplots(figsize=(12, 5))
     fig.suptitle(title, fontsize=13)
-    for col, color, label in [
-        ("recall_new_mean",    "#e63946", "New users — mean init"),
-        ("recall_new_content", "#2a9d8f", "New users — content init"),
-    ]:
+    series = [("recall_new_content", "#2a9d8f", "New users — content init")]
+    if has_mean_baseline:
+        series.append(("recall_new_mean", "#e63946", "New users — mean init"))
+    for col, color, label in series:
         ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
         ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
     ax.set_ylabel("Recall@10")
     ax.set_xlabel("Interactions seen")
-    ax.set_title("New User Recall: Mean Init vs Content-Aware Init")
+    ax.set_title("New User Recall: Content-Aware Init"
+                 + (" vs Mean Init" if has_mean_baseline else ""))
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=0)
     ax.legend(loc="upper right")
@@ -315,11 +319,13 @@ def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
     # ── Overall recall comparison ────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     fig.suptitle(title, fontsize=13)
-    for col, color, label in [
+    series = [
         ("recall_existing",        "#457b9d", "Existing users"),
-        ("recall_overall_mean",    "#e63946", "Overall — mean init"),
         ("recall_overall_content", "#2a9d8f", "Overall — content init"),
-    ]:
+    ]
+    if has_mean_baseline:
+        series.append(("recall_overall_mean", "#e63946", "Overall — mean init"))
+    for col, color, label in series:
         ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
         ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
     ax.set_ylabel("Recall@10")
