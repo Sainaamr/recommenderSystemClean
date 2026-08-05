@@ -56,48 +56,73 @@ class IncrementalLightGCN(LightGCN):
         return model
 
     # Embedding expansion for new users/items
+    """
+    new_n_users: The target total row count the table
+    row_overrides: a plain dict keys are new uid numbers, values are content-based
+    embedding vectors
+    """
+    def _expand_user_rows(self, new_n_users: int, row_overrides: dict = None):
         """
-        new_n_users: Total number of user rows of the model's embedding table post expansion
-        new_n_items: Total number of item rows of the model's embedding table post expansion
+        Grow user_embedding to new_n_users rows. New rows default to the mean
+        of existing rows; any row index present in row_overrides (uid -> (d,)
+        vector) is written directly instead of the mean.
         """
-    def expand_embeddings(self, new_n_users: int, new_n_items: int):
+        if new_n_users <= self.n_users:
+            return
+        old_weight = self.user_embedding.weight.data
+        # mean of all existing user embeddings down column for each dimension keep the shape
+        # as table with one row
+        mean_emb = old_weight.mean(dim=0, keepdim=True)
+        n_new = new_n_users - self.n_users
+        # exand the table only for new rows and no new column and save it in new place
+        new_rows = mean_emb.expand(n_new, -1).clone()
+        if row_overrides:
+            for uid, vec in row_overrides.items():
+                if self.n_users <= uid < new_n_users:
+                    new_rows[uid - self.n_users] = torch.as_tensor(
+                        vec, dtype=new_rows.dtype, device=new_rows.device)
+        new_weight = torch.cat([old_weight, new_rows], dim=0)
+
+        # create new table with the right size becuase pytoch's nn.embedding size is fixed
+        self.user_embedding = nn.Embedding(new_n_users, self.latent_dim)
+        # set the expanded embedding and mark as trainable
+        self.user_embedding.weight = nn.Parameter(new_weight)
+        self.user_embedding.to(self.device)
+        old_n = self.n_users
+        self.n_users = new_n_users
+        n_seeded = len(row_overrides) if row_overrides else 0
+        if n_seeded:
+            print(f"  Expanded user embeddings: {old_n} → {new_n_users} "
+                  f"(+{n_new} new users, {n_seeded} content-seeded)")
+        else:
+            print(f"  Expanded user embeddings: {old_n} → {new_n_users} (+{n_new} new users)")
+
+    """
+    new_n_items: The target total row count the table
+    """
+    def _expand_item_rows(self, new_n_items: int):
+        """Grow item_embedding to new_n_items rows, always mean-init."""
+        if new_n_items <= self.n_items:
+            return
+        old_weight = self.item_embedding.weight.data
+        mean_emb = old_weight.mean(dim=0, keepdim=True)
+        n_new = new_n_items - self.n_items
+
+        new_rows = mean_emb.expand(n_new, -1).clone()
+        new_weight = torch.cat([old_weight, new_rows], dim=0)
+        self.item_embedding = nn.Embedding(new_n_items, self.latent_dim)
+        self.item_embedding.weight = nn.Parameter(new_weight)
+        self.item_embedding.to(self.device)
+        old_n = self.n_items
+        self.n_items = new_n_items
+        print(f"  Expanded item embeddings: {old_n} → {new_n_items} (+{n_new} new items)")
+
+    def _rebuild_graph(self):
         """
-        Expand user and/or item embedding matrices to accommodate new entities.
-        New rows are initialized with the mean of all existing embeddings so
-        new users/items start with an average representation rather than random noise.
+        Rebuild the interaction graph and normalized adjacency matrix from
+        self._coo_rows/_coo_cols at the current (self.n_users, self.n_items)
+        shape, and invalidate RecBole's forward-pass embedding cache.
         """
-        if new_n_users > self.n_users:
-            old_weight = self.user_embedding.weight.data
-            # mean of all existing user embeddings down column for each dimension keep the shape
-            # as table with one row
-            mean_emb = old_weight.mean(dim=0, keepdim=True)
-            n_new = new_n_users - self.n_users
-            # exand the table only for new rows and no new column and save it in new place
-            new_rows = mean_emb.expand(n_new, -1).clone()
-            new_weight = torch.cat([old_weight, new_rows], dim=0)
-
-            # create new table with the right size becuase pytoch's nn.embedding size is fixed
-            self.user_embedding = nn.Embedding(new_n_users, self.latent_dim)
-            # set the expanded embedding and mark as trainable
-            self.user_embedding.weight = nn.Parameter(new_weight)
-            self.user_embedding.to(self.device)
-            self.n_users = new_n_users
-            print(f"  Expanded user embeddings: {new_n_users - n_new} → {new_n_users} (+{n_new} new users)")
-
-        if new_n_items > self.n_items:
-            old_weight = self.item_embedding.weight.data
-            mean_emb = old_weight.mean(dim=0, keepdim=True)
-            n_new = new_n_items - self.n_items
-
-            new_rows = mean_emb.expand(n_new, -1).clone()
-            new_weight = torch.cat([old_weight, new_rows], dim=0)
-            self.item_embedding = nn.Embedding(new_n_items, self.latent_dim)
-            self.item_embedding.weight = nn.Parameter(new_weight)
-            self.item_embedding.to(self.device)
-            self.n_items = new_n_items
-            print(f"  Expanded item embeddings: {new_n_items - n_new} → {new_n_items} (+{n_new} new items)")
-
-
         data = np.ones(len(self._coo_rows), dtype=np.float32)
         # build a matrix one row per user and one column per item and each entry is one if there
         # is an interaction between that item and user
@@ -109,6 +134,61 @@ class IncrementalLightGCN(LightGCN):
         self.norm_adj_matrix = self.get_norm_adj_mat().to(self.device)
 
         # Invalidate cache after any expansion
+        self.restore_user_e = None
+        self.restore_item_e = None
+    """
+    new_n_items: The target total row count the table of item embeddings
+    new_n_users: The target total row count the table of user embeddings
+    """
+    def expand_embeddings(self, new_n_users: int, new_n_items: int):
+        """
+        Expand user and/or item embedding matrices to accommodate new entities.
+        New rows are initialized with the mean of all existing embeddings so
+        new users/items start with an average representation rather than random noise.
+        """
+        self._expand_user_rows(new_n_users)
+        self._expand_item_rows(new_n_items)
+        self._rebuild_graph()
+    """
+    new_n_items: The target total row count the table of item embeddings
+    new_n_users: The target total row count the table of user embeddings
+    row_overrides: a plain dict keys are new uid numbers, values are content-based
+    embedding vectors
+    """
+    def expand_embeddings_content(self, new_n_users: int, new_n_items: int,
+                                   user_content_init: dict = None):
+
+        """
+        Same as expand_embeddings, except new user rows whose index is a key
+        in user_content_init are seeded with that vector instead of the mean
+        fallback. Item rows are always mean-init. New users not present in
+        user_content_init fall back to the mean.
+        """
+
+        self._expand_user_rows(new_n_users, row_overrides=user_content_init)
+        self._expand_item_rows(new_n_items)
+        self._rebuild_graph()
+
+    """
+     uid_to_emb: a plain dict keys are new uid numbers, values are content-based
+    embedding vectors
+    """
+    def set_user_embeddings(self, uid_to_emb: dict):
+
+        """
+        Overwrite specific EXISTING user rows in place — no shape change, no
+        graph rebuild. Used to seed a still-uninformed "new" user's row with
+        a content embedding computed from their first real interaction (a
+        one-time event, not a repeated refresh) as soon as they have one.
+        """
+
+        if not uid_to_emb:
+            return
+        with torch.no_grad():
+            for uid, vec in uid_to_emb.items():
+                if uid < self.n_users:
+                    self.user_embedding.weight.data[uid] = torch.as_tensor(
+                        vec, dtype=self.user_embedding.weight.dtype, device=self.device)
         self.restore_user_e = None
         self.restore_item_e = None
 
