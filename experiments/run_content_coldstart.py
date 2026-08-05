@@ -36,7 +36,7 @@ from experiments.run_incremental_lightgcn import (
     DATASET_CONFIGS, RESULTS_DIR, BATCH_SIZE,
     load_id_mappings, build_user_history, train_historical,
 )
-from tools.plot_utils import plot_content_coldstart
+from tools.plot_utils import plot_content_coldstart, _CONTENT_COLDSTART_METRICS
 
 ITEM_META_PATH = "dataset/yelp/yelp.item"
 
@@ -360,15 +360,21 @@ def main():
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0
-    print(f"  Avg recall new users (content init): {plot_df.loc[new_mask, 'recall_new_content'].mean():.4f}")
-    print(f"  Avg recall overall   (content init): {plot_df['recall_overall_content'].mean():.4f}")
-    if "recall_new_mean" in plot_df.columns:
-        print(f"  Avg recall new users (mean init):    {plot_df.loc[new_mask, 'recall_new_mean'].mean():.4f}")
-        print(f"  Avg recall overall   (mean init):    {plot_df['recall_overall_mean'].mean():.4f}")
-        gain = (plot_df.loc[new_mask, 'recall_new_content'].mean()
-                - plot_df.loc[new_mask, 'recall_new_mean'].mean())
-        print(f"  Content init gain on new users:      {gain:+.4f}")
-    else:
+    any_mean_baseline = False
+    for metric, label, has_baseline_col in _CONTENT_COLDSTART_METRICS:
+        new_content = plot_df.loc[new_mask, f"{metric}_new_content"].mean()
+        overall_content = plot_df[f"{metric}_overall_content"].mean()
+        print(f"  Avg {label:<11} new users (content init): {new_content:.4f}")
+        print(f"  Avg {label:<11} overall   (content init): {overall_content:.4f}")
+        mean_col = f"{metric}_new_mean"
+        if has_baseline_col and mean_col in plot_df.columns:
+            any_mean_baseline = True
+            new_mean = plot_df.loc[new_mask, mean_col].mean()
+            overall_mean = plot_df[f"{metric}_overall_mean"].mean()
+            print(f"  Avg {label:<11} new users (mean init):    {new_mean:.4f}")
+            print(f"  Avg {label:<11} overall   (mean init):    {overall_mean:.4f}")
+            print(f"  {label:<11} gain on new users:            {new_content - new_mean:+.4f}")
+    if not any_mean_baseline:
         print("  (pass --new-user-csv <run_new_user_analysis.py CSV> for a mean-init comparison)")
 
     print(f"  Historical training emissions:       {training_emissions_mg:.4f} mg CO2eq")
