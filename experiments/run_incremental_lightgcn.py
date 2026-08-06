@@ -300,21 +300,6 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                 next_item_id[0] += 1
             return item2id[key]
 
-        # new column with original row number
-        df["uid"] = df["user_id:token"].apply(get_or_create_uid)
-        df["iid"] = df["item_id:token"].apply(get_or_create_iid)
-        df["uid"] = df["uid"].astype(int)
-        df["iid"] = df["iid"].astype(int)
-
-        # Expand model embeddings upfront for all new entities seen in the stream.
-        # New rows are initialized with mean of existing embeddings.
-        # For incremental: add_interactions will also expand as new IDs arrive per batch.
-        # For no_update: this is not important since it is never actually used
-        max_uid = int(df["uid"].max()) + 1
-        max_iid = int(df["iid"].max()) + 1
-        if max_uid > model.n_users or max_iid > model.n_items:
-            model.expand_embeddings(max(max_uid, model.n_users), max(max_iid, model.n_items))
-
         n_batches = len(df) // batch_size
 
         # Buffer to accumulate new interactions since last update
@@ -322,7 +307,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         buffer_items = []
 
     for i in range(n_batches):
-        batch = df.iloc[i * batch_size: (i + 1) * batch_size]
+        batch = df.iloc[i * batch_size: (i + 1) * batch_size].copy()
 
         if strategy == "full_retrain":
             batch_users, batch_items = [], []
@@ -333,8 +318,20 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                     batch_users.append(u)
                     batch_items.append(it)
         else:
+            # per-batch ID resolution
+            batch["uid"] = batch["user_id:token"].apply(get_or_create_uid).astype(int)
+            batch["iid"] = batch["item_id:token"].apply(get_or_create_iid).astype(int)
             batch_users = batch["uid"].tolist()
             batch_items = batch["iid"].tolist()
+
+            # expansion — only grow the table if THIS batch actually
+            # introduced a uid/iid beyond the model's current size
+            max_i = max(batch_items, default=0)
+            if max_u >= model.n_users or max_i >= model.n_items:
+                model.expand_embeddings(
+                    max(max_u + 1, model.n_users),
+                    max(max_i + 1, model.n_items),
+                )
 
         # Measure metrics before update (reflects current model state, no data leakage)
         if batch_users:

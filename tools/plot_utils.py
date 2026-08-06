@@ -277,68 +277,84 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
     _plot_population_growth(df, base, title)
 
 
+
+# metric key -> (display label, has a mean-init baseline column to compare against)
+# run_new_user_analysis.py only computes recall/precision/ndcg, not hr/mrr, so
+# those two have no mean-init counterpart to merge in or plot.
+_CONTENT_COLDSTART_METRICS = [
+    ("recall",    "Recall@10",    True),
+    ("precision", "Precision@10", True),
+    ("ndcg",      "NDCG@10",      True),
+    ("hr",        "HR@10",        False),
+    ("mrr",       "MRR",          False),
+]
+
+
 def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
                            batch_size: int = 1000, smooth: int = 20):
     """
-    One PNG comparing new-user recall under content-init (and mean-init too,
-    if recall_new_mean is present — merge it in from a run_new_user_analysis.py
+    For every metric in _CONTENT_COLDSTART_METRICS, one PNG comparing new-user
+    performance under content-init (and mean-init too, if the corresponding
+    *_new_mean column is present — merge it in from a run_new_user_analysis.py
     CSV via --new-user-csv, since that script already computes the identical
-    mean-init numbers and recomputing them here would be redundant), one PNG
-    comparing overall recall, plus the same shared new-user-arrivals and
-    population-growth PNGs used by plot_new_user_analysis.
+    mean-init numbers and recomputing them here would be redundant), and one
+    PNG comparing overall performance, plus the same shared new-user-arrivals
+    and population-growth PNGs used by plot_new_user_analysis.
     """
     base = Path(str(out_path).replace(".png", ""))
     x = df["interactions"]
-    has_mean_baseline = "recall_new_mean" in df.columns
 
     def smoothed(col):
         return df[col].rolling(smooth, min_periods=1, center=True).mean()
 
-    # ── New user recall: content init (+ mean init, if merged in) ───────────
-    fig, ax = plt.subplots(figsize=(12, 5))
-    fig.suptitle(title, fontsize=13)
-    series = [("recall_new_content", "#2a9d8f", "New users — content init")]
-    if has_mean_baseline:
-        series.append(("recall_new_mean", "#e63946", "New users — mean init"))
-    for col, color, label in series:
-        ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
-        ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
-    ax.set_ylabel("Recall@10")
-    ax.set_xlabel("Interactions seen")
-    ax.set_title("New User Recall: Content-Aware Init"
-                 + (" vs Mean Init" if has_mean_baseline else ""))
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-    ax.legend(loc="upper right")
-    plt.tight_layout()
-    path = Path(f"{base}_new_user_recall.png")
-    plt.savefig(path, dpi=DPI)
-    print(f"Plot saved → {path}")
-    plt.close()
+    for metric, ylabel, has_baseline_col in _CONTENT_COLDSTART_METRICS:
+        has_mean_baseline = has_baseline_col and f"{metric}_new_mean" in df.columns
 
-    # ── Overall recall comparison ────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(12, 5))
-    fig.suptitle(title, fontsize=13)
-    series = [
-        ("recall_existing",        "#457b9d", "Existing users"),
-        ("recall_overall_content", "#2a9d8f", "Overall — content init"),
-    ]
-    if has_mean_baseline:
-        series.append(("recall_overall_mean", "#e63946", "Overall — mean init"))
-    for col, color, label in series:
-        ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
-        ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
-    ax.set_ylabel("Recall@10")
-    ax.set_xlabel("Interactions seen")
-    ax.set_title("Overall Recall Comparison")
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-    ax.legend(loc="upper right")
-    plt.tight_layout()
-    path = Path(f"{base}_overall_recall.png")
-    plt.savefig(path, dpi=DPI)
-    print(f"Plot saved → {path}")
-    plt.close()
+        # ── New user: content init (+ mean init, if merged in) ──────────────
+        fig, ax = plt.subplots(figsize=(12, 5))
+        fig.suptitle(title, fontsize=13)
+        series = [(f"{metric}_new_content", "#2a9d8f", "New users — content init")]
+        if has_mean_baseline:
+            series.append((f"{metric}_new_mean", "#e63946", "New users — mean init"))
+        for col, color, label in series:
+            ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
+            ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Interactions seen")
+        ax.set_title(f"New User {ylabel}: Content-Aware Init"
+                     + (" vs Mean Init" if has_mean_baseline else ""))
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        ax.legend(loc="upper right")
+        plt.tight_layout()
+        path = Path(f"{base}_new_user_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
+
+        # ── Overall comparison ───────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(12, 5))
+        fig.suptitle(title, fontsize=13)
+        series = [
+            (f"{metric}_existing",        "#457b9d", "Existing users"),
+            (f"{metric}_overall_content", "#2a9d8f", "Overall — content init"),
+        ]
+        if has_mean_baseline:
+            series.append((f"{metric}_overall_mean", "#e63946", "Overall — mean init"))
+        for col, color, label in series:
+            ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
+            ax.plot(x, smoothed(col), color=color, linewidth=2, label=f"{label} (smoothed)")
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Interactions seen")
+        ax.set_title(f"Overall {ylabel} Comparison")
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=0)
+        ax.legend(loc="upper right")
+        plt.tight_layout()
+        path = Path(f"{base}_overall_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
 
     _plot_new_user_arrivals(df, base, title, batch_size=batch_size)
     _plot_population_growth(df, base, title)
