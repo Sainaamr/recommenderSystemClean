@@ -518,8 +518,8 @@ def main():
     # Historical training emissions are only otherwise persisted in the
     # gitignored saved/*.energy.json sidecar — mirror it into results/
     # (git-tracked) so it survives independently of the checkpoint.
-    energy_summary_path = Path(str(cfg["results_csv"]).replace(".csv", "_training_energy.json"))
-    energy_summary_path.write_text(json.dumps({"training_emissions_mg": training_emissions_mg}))
+    energy_summary_path = Path(str(cfg["results_csv"]).replace(".csv", "_training_energy.csv"))
+    pd.DataFrame([{"training_emissions_mg": training_emissions_mg}]).to_csv(energy_summary_path, index=False)
     print(f"Training emissions saved → {energy_summary_path}")
 
     plot_results(results, cfg, training_emissions_mg=training_emissions_mg)

@@ -21,7 +21,7 @@ Usage:
 Note: only works meaningfully for yelp (requires yelp.item metadata).
 """
 
-import os, sys, json, argparse, torch
+import os, sys, argparse, torch
 from pathlib import Path
 from datetime import datetime
 
@@ -398,9 +398,9 @@ def main():
         out_png = Path(str(args.csv).replace(".csv", "_replot.png"))
         print(f"Loaded existing results from {args.csv}")
 
-        energy_path = Path(str(args.csv).replace(".csv", "_energy.json"))
+        energy_path = Path(str(args.csv).replace(".csv", "_energy.csv"))
         if energy_path.exists():
-            emissions = json.loads(energy_path.read_text())
+            emissions = pd.read_csv(energy_path).iloc[0]
             training_emissions_mg      = emissions.get("training_emissions_mg", 0.0)
             streaming_emissions_mg     = emissions.get("streaming_emissions_mg", 0.0)
             content_build_emissions_mg = emissions.get("content_build_emissions_mg", 0.0)
@@ -432,12 +432,12 @@ def main():
         df.to_csv(out_csv, index=False)
         print(f"\nResults saved → {out_csv}")
 
-        energy_path = Path(str(out_csv).replace(".csv", "_energy.json"))
-        energy_path.write_text(json.dumps({
+        energy_path = Path(str(out_csv).replace(".csv", "_energy.csv"))
+        pd.DataFrame([{
             "training_emissions_mg":      training_emissions_mg,
             "streaming_emissions_mg":     streaming_emissions_mg,
             "content_build_emissions_mg": content_build_emissions_mg,
-        }))
+        }]).to_csv(energy_path, index=False)
         print(f"Emissions saved → {energy_path}")
 
     plot_df = df
