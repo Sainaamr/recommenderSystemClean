@@ -25,6 +25,10 @@ Usage:
     # also save the summary table as a CSV
     python3 tools/compare_results.py --baseline-csv ... --comparison-csv ... \
         --out results/no_update_vs_incremental_compare.csv
+
+    # also save it as a formatted LaTeX table
+    python3 tools/compare_results.py --baseline-csv ... --comparison-csv ... \
+        --latex results/no_update_vs_incremental_compare.tex
 """
 
 import argparse
@@ -75,6 +79,25 @@ def compare_metric(df_a: pd.DataFrame, df_b: pd.DataFrame, metric: str) -> dict:
     }
 
 
+def format_for_latex(summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    summary: the metric-indexed DataFrame built in main(). Raw floats format
+    badly for a thesis table as-is — mean/gap columns want a fixed decimal
+    count, pct_improvement reads better with a literal '%', and wilcoxon_p
+    rounds to '0.0000' at 4 decimals (these p-values run ~1e-30 to 1e-60),
+    so it gets scientific notation instead. Returns a string-valued
+    DataFrame ready for to_latex(), with 'metric' restored as a plain
+    column instead of the index.
+    """
+    df = summary.reset_index()
+    for col in ["mean_baseline", "mean_comparison", "mean_gap"]:
+        df[col] = df[col].map(lambda x: f"{x:.4f}")
+    df["pct_improvement"] = df["pct_improvement"].map(lambda x: f"{x:.2f}\\%")
+    df["win_rate"] = df["win_rate"].map(lambda x: f"{x:.3f}")
+    df["wilcoxon_p"] = df["wilcoxon_p"].map(lambda x: f"{x:.2e}")
+    return df
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-csv", type=Path, required=True,
@@ -86,6 +109,8 @@ def main():
                              "column present in both CSVs")
     parser.add_argument("--out", type=Path, default=None,
                         help="Save the summary table as a CSV to this path")
+    parser.add_argument("--latex", type=Path, default=None,
+                        help="Save the summary table as a formatted LaTeX table to this path")
     args = parser.parse_args()
 
     df_a = pd.read_csv(args.baseline_csv)
@@ -110,6 +135,10 @@ def main():
     if args.out:
         summary.to_csv(args.out)
         print(f"\nSummary saved → {args.out}")
+
+    if args.latex:
+        args.latex.write_text(format_for_latex(summary).to_latex(index=False))
+        print(f"LaTeX table saved → {args.latex}")
 
 
 if __name__ == "__main__":
