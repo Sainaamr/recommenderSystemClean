@@ -326,6 +326,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
             # expansion — only grow the table if THIS batch actually
             # introduced a uid/iid beyond the model's current size
+            max_u = max(batch_users, default=0)
             max_i = max(batch_items, default=0)
             if max_u >= model.n_users or max_i >= model.n_items:
                 model.expand_embeddings(
