@@ -130,9 +130,8 @@ def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
     # excluded).
     updates = df[df.get("updated", pd.Series(False, index=df.index)) == True]
     for strategy, grp in updates.groupby("strategy"):
-        color = COLORS.get(strategy, COLORS["incremental"])
         for j, x in enumerate(grp["interactions"]):
-            ax.axvline(x, color=color, alpha=0.35, linewidth=1.2, linestyle="--",
+            ax.axvline(x, color="black", alpha=0.55, linewidth=1.2, linestyle="--",
                        label=f"{label_map.get(strategy, strategy)} triggered" if j == 0 else None)
 
     max_x = int(df["interactions"].max())
