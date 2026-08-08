@@ -520,10 +520,24 @@ def main():
     # gitignored saved/*.energy.json sidecar — mirror it into results/
     # (git-tracked) so it survives independently of the checkpoint. Shared
     # across all strategies run in this invocation, since training cost is
-    # tied to the checkpoint, not to any individual strategy.
-    energy_summary_path = results_dir / f"{dataset_prefix}_hybrid_training_energy_{ts}.csv"
-    pd.DataFrame([{"training_emissions_mg": training_emissions_mg}]).to_csv(energy_summary_path, index=False)
-    print(f"Training emissions saved → {energy_summary_path}")
+    # tied to the checkpoint, not to any individual strategy. Each updating
+    # strategy's total ongoing emissions (summed from its own
+    # update_emissions_mg column) is included alongside it, so this one CSV
+    # captures both the one-time and cumulative ongoing costs for the run —
+    # no_update is skipped since it never updates and would just be 0.
+    energy_row = {"training_emissions_mg": training_emissions_mg}
+    for strategy, df in dfs.items():
+        if strategy == "no_update":
+            continue
+        total_emissions = df["update_emissions_mg"].sum()
+        n_updates = int(df["updated"].sum())
+        energy_row[f"{strategy}_total_emissions_mg"] = total_emissions
+        energy_row[f"{strategy}_n_updates"] = n_updates
+        energy_row[f"{strategy}_avg_emissions_per_update_mg"] = total_emissions / max(n_updates, 1)
+
+    energy_summary_path = results_dir / f"{dataset_prefix}_hybrid_emissions_summary_{ts}.csv"
+    pd.DataFrame([energy_row]).to_csv(energy_summary_path, index=False)
+    print(f"Emissions summary saved → {energy_summary_path}")
 
     # Summary
     print("\n── Summary ──────────────────────────────────────────────")

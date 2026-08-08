@@ -27,3 +27,7 @@ saved/*
 # RecBole's own training logs
 log/
 log_tensorboard/
+
+# Superseded results from before the results/ directory reorg — kept locally
+# for reference, not tracked going forward
+results/old/
