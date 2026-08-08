@@ -354,9 +354,12 @@ def main():
         plot_df = merge_new_user_baseline(df, args.new_user_csv)
         print(f"Merged mean-init baseline from {args.new_user_csv}")
 
-    plot_content_coldstart(plot_df, out_png,
-                           "Content-Aware Cold Start — yelp (no retraining)",
-                           batch_size=BATCH_SIZE)
+    # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
+    # generate plots separately later via --csv <path>.
+    if args.csv:
+        plot_content_coldstart(plot_df, out_png,
+                               "Content-Aware Cold Start — yelp (no retraining)",
+                               batch_size=BATCH_SIZE)
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0

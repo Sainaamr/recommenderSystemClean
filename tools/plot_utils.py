@@ -169,6 +169,23 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
     plt.close()
 
 
+def combine_results(csv_paths: list, out_path: Path, title: str,
+                    update_every: int, training_emissions_mg: float = None) -> pd.DataFrame:
+    """
+    Load two or more separately-saved results CSVs (each with a 'strategy'
+    column, matching run_incremental_lightgcn.py's per-strategy output
+    schema), concatenate them in memory — never written to disk as a new
+    CSV — and plot the combined comparison via plot_streaming_results.
+    Returns the combined DataFrame in case the caller wants it for anything
+    else.
+    """
+    dfs = [pd.read_csv(p) for p in csv_paths]
+    combined = pd.concat(dfs, ignore_index=True)
+    plot_streaming_results(combined, out_path, title, update_every,
+                           training_emissions_mg=training_emissions_mg)
+    return combined
+
+
 def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
                             batch_size: int = 1000):
     """

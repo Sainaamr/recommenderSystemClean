@@ -214,9 +214,12 @@ def main():
         df.to_csv(out_csv, index=False)
         print(f"\nResults saved → {out_csv}")
 
-    plot_new_user_analysis(df, out_png,
-                           f"New User Drift Analysis — {args.dataset} (no retraining)",
-                           batch_size=BATCH_SIZE)
+    # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
+    # generate plots separately later via --csv <path>.
+    if args.csv:
+        plot_new_user_analysis(df, out_png,
+                               f"New User Drift Analysis — {args.dataset} (no retraining)",
+                               batch_size=BATCH_SIZE)
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     print(f"  Avg recall — existing users: {df['recall_existing'].mean():.4f}")

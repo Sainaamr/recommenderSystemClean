@@ -482,15 +482,12 @@ def main():
     cfg = DATASET_CONFIGS[args.dataset].copy()
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stamp output filenames with the requested strategies + a timestamp, so
-    # runs never overwrite each other AND the filename alone tells you which
-    # strategy/strategies it holds (useful since strategies are often run as
-    # separate invocations rather than all together).
+    # Stamp output filenames with a shared timestamp, so runs never overwrite
+    # each other. Each requested strategy gets its OWN separate results CSV
+    # (not merged into one combined file) — use tools.plot_utils.combine_results
+    # afterward to load two or more of these CSVs together and plot them.
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_prefix = args.dataset.replace("-", "")
-    strategy_tag = "_".join(s for s in STRATEGIES if run_flags[s])
-    cfg["results_csv"] = results_dir / f"{dataset_prefix}_hybrid_results_{strategy_tag}_{ts}.csv"
-    cfg["results_png"] = results_dir / f"{dataset_prefix}_hybrid_curves_{strategy_tag}_{ts}.png"
     print(f"Run timestamp: {ts}")
 
     # Step 1: Train or load checkpoint
@@ -500,6 +497,7 @@ def main():
     # of the same historical checkpoint (so strategies are directly
     # comparable, none of them chain off another's updated weights).
     dfs = {}
+    csv_paths = {}
     for strategy in STRATEGIES:
         if not run_flags[strategy]:
             continue
@@ -507,22 +505,24 @@ def main():
         user2id, item2id, config, dataset = load_id_mappings(cfg)
         model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
         user_history = build_user_history(user2id, item2id, cfg)
-        dfs[strategy] = run_streaming(model, user2id, item2id, user_history,
-                                      strategy=strategy, cfg=cfg)
+        df = run_streaming(model, user2id, item2id, user_history,
+                           strategy=strategy, cfg=cfg)
+        dfs[strategy] = df
 
-    # Step 3: Save and plot
-    results = pd.concat(list(dfs.values()), ignore_index=True)
-    results.to_csv(cfg["results_csv"], index=False)
-    print(f"\nResults saved → {cfg['results_csv']}")
+        # Step 3: Save each strategy's results to its own CSV immediately
+        strategy_csv = results_dir / f"{dataset_prefix}_hybrid_results_{strategy}_{ts}.csv"
+        df.to_csv(strategy_csv, index=False)
+        csv_paths[strategy] = strategy_csv
+        print(f"Results saved → {strategy_csv}")
 
     # Historical training emissions are only otherwise persisted in the
     # gitignored saved/*.energy.json sidecar — mirror it into results/
-    # (git-tracked) so it survives independently of the checkpoint.
-    energy_summary_path = Path(str(cfg["results_csv"]).replace(".csv", "_training_energy.csv"))
+    # (git-tracked) so it survives independently of the checkpoint. Shared
+    # across all strategies run in this invocation, since training cost is
+    # tied to the checkpoint, not to any individual strategy.
+    energy_summary_path = results_dir / f"{dataset_prefix}_hybrid_training_energy_{ts}.csv"
     pd.DataFrame([{"training_emissions_mg": training_emissions_mg}]).to_csv(energy_summary_path, index=False)
     print(f"Training emissions saved → {energy_summary_path}")
-
-    plot_results(results, cfg, training_emissions_mg=training_emissions_mg)
 
     # Summary
     print("\n── Summary ──────────────────────────────────────────────")
