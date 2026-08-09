@@ -148,7 +148,7 @@ def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
     # containing essentially all of the data and all of the smoothed trend.
     y_min, y_max = df[metric].quantile(0.01), df[metric].quantile(0.99)
     pad = (y_max - y_min) * 0.08
-    ax.set_ylim(y_min - pad, y_max + pad)
+    ax.set_ylim(max(0, y_min - pad), y_max + pad)  # metric can't go negative
     _add_end_xtick(ax, max_x)
     ax.legend(loc="upper left", frameon=True)
 
@@ -333,12 +333,15 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
                            title: str, update_every: int,
                            training_emissions_mg: float = None, subtitle: str = None):
     """
-    One PNG per available metric + one emissions PNG.
+    One PNG per available metric.
     out_path is used as base — metric name suffix added per file.
 
     subtitle overrides each metric plot's per-axes title (see
     plot_metric_over_time) — e.g. the dataset name, when title already
     states the comparison being made.
+
+    No emissions plot is produced here — use plot_energy_bars or
+    plot_emissions_stacked directly when an emissions chart is wanted.
     """
     base = Path(str(out_path).replace(".png", ""))
 
@@ -352,15 +355,6 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
-
-    # Emissions plot
-    fig, ax = plt.subplots(figsize=(12, 4))
-    plot_energy_bars(ax, df, training_emissions_mg=training_emissions_mg)
-    _center_suptitle_over_axes(fig, ax, title)
-    energy_path = Path(f"{base}_energy.png")
-    plt.savefig(energy_path, dpi=DPI)
-    print(f"Plot saved → {energy_path}")
-    plt.close()
 
 
 def combine_results(csv_paths: list, out_path: Path, title: str,
@@ -382,70 +376,90 @@ def combine_results(csv_paths: list, out_path: Path, title: str,
 
 
 def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
-                            batch_size: int = 1000):
+                            batch_size: int = 1000, update_every: int = 20):
     """
-    New user arrivals per batch — shared by plot_new_user_analysis and
-    plot_content_coldstart, both of which track the same n_new_users column.
-    """
-    x = df["interactions"]
-    fig, ax = plt.subplots(figsize=(12, 5))
-    fig.suptitle(title, fontsize=13)
-    ax.bar(x, df["n_new_users"], width=batch_size * 0.8,
-           color="#e63946", alpha=0.4, label="New users per batch")
-    ax.set_ylabel("Unique new users")
-    ax.set_xlabel("Interactions seen (real-time stream)")
-    ax.set_title("New User Arrivals per Batch")
-    ax.set_xlim(left=0, right=int(x.max()))
-    ax.set_ylim(bottom=0)
-    _add_end_xtick(ax, int(x.max()))
-    ax.legend(loc="upper left")
+    New user arrivals per update_every-batch window (i.e. the same window
+    an incremental update trains on) rather than per single batch — one bar
+    per training point instead of 539 barely-visible slivers, each bar
+    centered on the interaction range it covers. Shared by
+    plot_new_user_analysis and plot_content_coldstart.
 
-    plt.tight_layout()
+    If df has a "window_unique_users" column (run_new_user_analysis.py
+    only — a running, cross-batch-deduplicated count of active users since
+    the last window boundary; its value at a window's last batch is that
+    window's true unique-user total), the bar is stacked: new users at the
+    bottom, existing active users (window_unique_users - n_new_users) on
+    top, so the full bar height reads as "everyone active this window".
+    Without that column (e.g. plot_content_coldstart, which doesn't track
+    it), only the new-user bar is drawn, same as before.
+    """
+    # Per-chunk width, not a fixed batch_size * update_every: the last chunk
+    # is partial whenever the batch count isn't a multiple of update_every
+    # (e.g. 539 batches / 20 = 26 full chunks + 1 chunk of only 19), so
+    # assuming every chunk is full-size would make the last bar overhang
+    # into its neighbor.
+    agg = {"n_new_users": ("n_new_users", "sum"),
+          "interactions": ("interactions", "max"),
+          "n_batches": ("batch", "count")}
+    has_existing = "window_unique_users" in df.columns
+    if has_existing:
+        # max, not sum: window_unique_users is already a running total
+        # within the window, so its value at the window's last batch (which
+        # groupby-max picks out) IS the window's true unique-user count —
+        # summing it across batches would double-count repeat visitors.
+        agg["window_unique_users"] = ("window_unique_users", "max")
+
+    grouped = df.assign(chunk=(df["batch"] - 1) // update_every).groupby("chunk").agg(**agg)
+    widths = grouped["n_batches"] * batch_size
+    x = grouped["interactions"] - widths / 2  # center each bar on its window
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    # width=widths (not narrower): these windows are contiguous and
+    # exhaustive — chunk N covers exactly where chunk N-1 leaves off, so a
+    # gap between bars would visually (and wrongly) suggest uncovered gaps
+    # in the stream.
+    ax.bar(x, grouped["n_new_users"], width=widths,
+           color="#E69F00", alpha=0.4, edgecolor="#E69F00", linewidth=1.2,
+           label=f"New users per {update_every} batches")
+    if has_existing:
+        n_existing_active = grouped["window_unique_users"] - grouped["n_new_users"]
+        ax.bar(x, n_existing_active, width=widths, bottom=grouped["n_new_users"],
+              color="#0072B2", alpha=0.4, edgecolor="#0072B2", linewidth=1.2,
+              label="Existing active users")
+        ax.set_ylabel("Unique active users")
+        top_values = grouped["window_unique_users"]
+    else:
+        ax.set_ylabel("Unique new users")
+        top_values = grouped["n_new_users"]
+    ax.set_xlabel("Interactions seen")
+    ax.set_title("Active Users per Update Window" if has_existing
+                else "New User Arrivals per Update Window")
+    max_x = int(df["interactions"].max())
+    ax.set_xlim(left=0, right=max_x)
+    y_min, y_max = top_values.min(), top_values.max()
+    pad = (y_max - y_min) * 0.1
+    bottom = 0 if has_existing else max(0, y_min - pad)
+    ax.set_ylim(bottom, y_max + pad)
+    _add_end_xtick(ax, max_x)
+    ax.legend(loc="upper left")
+    _center_suptitle_over_axes(fig, ax, title)
+
     arrivals_path = Path(f"{base}_new_user_arrivals.png")
     plt.savefig(arrivals_path, dpi=DPI)
     print(f"Plot saved → {arrivals_path}")
     plt.close()
 
 
-def _plot_population_growth(df: pd.DataFrame, base: Path, title: str):
-    """
-    Cumulative total population (historical baseline + new users seen so
-    far) — shared by plot_new_user_analysis and plot_content_coldstart, both
-    of which track n_users_trained/n_new_users.
-    """
-    x = df["interactions"]
-    total_population = df["n_users_trained"].iloc[0] + df["n_new_users"].cumsum()
-    fig, ax = plt.subplots(figsize=(12, 5))
-    fig.suptitle(title, fontsize=13)
-    ax.plot(x, total_population, color="#457b9d", linewidth=2,
-            label="Total distinct users seen (historical + new)")
-    ax.axhline(df["n_users_trained"].iloc[0], color="#2a9d8f", linewidth=1.5,
-               linestyle="--", label="Historical baseline")
-    ax.set_ylabel("Total distinct users")
-    ax.set_xlabel("Interactions seen (real-time stream)")
-    ax.set_title("Population Growth Over Time")
-    ax.set_xlim(left=0, right=int(x.max()))
-    # No ylim(bottom=0) here deliberately — the population only ever grows by
-    # a small fraction of its starting size (e.g. ml-1m: 6022 -> ~6034), so
-    # forcing the axis down to 0 would squeeze all the actual variation into
-    # a sliver at the top of the chart. Let matplotlib auto-scale to the
-    # data's real range instead.
-    _add_end_xtick(ax, int(x.max()))
-    ax.legend(loc="upper left")
-
-    plt.tight_layout()
-    growth_path = Path(f"{base}_population_growth.png")
-    plt.savefig(growth_path, dpi=DPI)
-    print(f"Plot saved → {growth_path}")
-    plt.close()
-
-
 def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
-                           batch_size: int = 1000, smooth: int = 20):
+                           batch_size: int = 1000, smooth: int = 20,
+                           subtitle: str = None, update_every: int = 20):
     """
     One PNG per metric (recall/precision/ndcg @10 — each showing existing vs
-    new vs overall users), plus one PNG for new user arrivals per batch, plus
-    one PNG for cumulative total population growth over time.
+    new vs overall users), plus one PNG for new user arrivals.
+
+    subtitle overrides each metric plot's per-axes title (see
+    plot_metric_over_time) — e.g. the dataset name, when title already
+    states what's being measured.
     """
     base = Path(str(out_path).replace(".png", ""))
     x = df["interactions"]
@@ -454,13 +468,13 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
         return df[col].rolling(smooth, min_periods=1, center=True).mean()
 
     group_colors = {
-        "existing": "#2a9d8f",
-        "new_user": "#e63946",
-        "overall":  "#457b9d",
+        "existing": "#0072B2",  # blue (Wong/Okabe-Ito, Nature Methods 2011)
+        "new_user": "#E69F00",  # orange (Wong/Okabe-Ito)
+        "overall":  "#56B4E9",  # sky blue (Wong/Okabe-Ito)
     }
     group_labels = {
         "existing": "Existing users",
-        "new_user": "New users — mean emb",
+        "new_user": "New users",
         "overall":  "Overall",
     }
     metrics = [("recall", "Recall@10"), ("precision", "Precision@10"), ("ndcg", "NDCG@10")]
@@ -468,30 +482,36 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
 
     for metric, label in metrics:
         fig, ax = plt.subplots(figsize=(12, 5))
-        fig.suptitle(title, fontsize=13)
 
         for group, color in group_colors.items():
             col = f"{metric}_{group}"
             ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
             ax.plot(x, smoothed(col), color=color, linewidth=2,
-                    label=f"{group_labels[group]} (smoothed)")
+                    label=group_labels[group])
 
-        ax.set_xlabel("Interactions seen (real-time stream)")
+        # Zoom to the 1st-99th percentile range across all three groups
+        # instead of forcing the axis down to 0 — see plot_metric_over_time
+        # for why (occasional one-batch noise spikes otherwise dictate the
+        # whole frame and flatten the real variation).
+        cols = [f"{metric}_{group}" for group in group_colors]
+        y_min, y_max = df[cols].stack().quantile(0.01), df[cols].stack().quantile(0.99)
+        pad = (y_max - y_min) * 0.08
+
+        ax.set_xlabel("Interactions seen")
         ax.set_ylabel(label)
-        ax.set_title(f"{label} by User Group Over Time")
+        ax.set_title(subtitle or f"{label} by User Group Over Time")
         ax.set_xlim(left=0, right=max_x)
-        ax.set_ylim(bottom=0)
+        ax.set_ylim(max(0, y_min - pad), y_max + pad)  # metric can't go negative
         _add_end_xtick(ax, max_x)
         ax.legend(loc="upper left")
+        _center_suptitle_over_axes(fig, ax, title)
 
-        plt.tight_layout()
         path = Path(f"{base}_{metric}.png")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
 
-    _plot_new_user_arrivals(df, base, title, batch_size=batch_size)
-    _plot_population_growth(df, base, title)
+    _plot_new_user_arrivals(df, base, title, batch_size=batch_size, update_every=update_every)
 
 
 
@@ -574,4 +594,3 @@ def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
         plt.close()
 
     _plot_new_user_arrivals(df, base, title, batch_size=batch_size)
-    _plot_population_growth(df, base, title)

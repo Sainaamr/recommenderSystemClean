@@ -32,7 +32,7 @@ import pandas as pd
 from src.evaluation.metrics import compute_metrics_at_ks, _avg
 from src.models.incremental_lightgcn import IncrementalLightGCN
 from experiments.run_incremental_lightgcn import (
-    DATASET_CONFIGS, RESULTS_DIR, BATCH_SIZE,
+    DATASET_CONFIGS, RESULTS_DIR, BATCH_SIZE, UPDATE_EVERY,
     load_id_mappings, build_user_history, train_historical,
 )
 from tools.plot_utils import plot_new_user_analysis
@@ -112,6 +112,9 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
     # interactions straddle a batch boundary
     seen_as_new = set()
 
+    # Tracks unique active uids since the last UPDATE_EVERY-batch window
+    window_active_users = set()
+
     print(f"  Streaming {n_batches} batches (no retraining)...")
 
     for i in range(n_batches):
@@ -148,27 +151,43 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
         seen_as_new |= new_user_set
         n_new_users = len(first_time_new)
 
-        pct_new_user = n_new_users / max(len(set(batch_users)), 1)
+        # Interaction-volume countt: every raw row in
+        # this batch whose uid is classified as new_user
+        n_new_user_interactions = sum(1 for uid in batch_users if uid >= n_users_trained)
+
+        n_unique_users = len(set(batch_users))
+        pct_new_user = n_new_users / max(n_unique_users, 1)
+
+        # Running, deduplicated count of unique active users since the last
+        # window boundary 
+        window_active_users.update(batch_users)
+        window_unique_users = len(window_active_users)
 
         for uid, iid in zip(batch_users, batch_items):
             history.setdefault(uid, set()).add(iid)
 
         records.append({
-            "batch":              i + 1,
-            "interactions":       (i + 1) * BATCH_SIZE,
-            "recall_existing":    m_existing["recall@10"],
-            "precision_existing": m_existing["precision@10"],
-            "ndcg_existing":      m_existing["ndcg@10"],
-            "recall_new_user":    m_new_user["recall@10"],
-            "precision_new_user": m_new_user["precision@10"],
-            "ndcg_new_user":      m_new_user["ndcg@10"],
-            "recall_overall":     m_overall["recall@10"],
-            "precision_overall":  m_overall["precision@10"],
-            "ndcg_overall":       m_overall["ndcg@10"],
-            "pct_new_user":       pct_new_user,
-            "n_new_users":        n_new_users,
-            "n_users_trained":    n_users_trained,
+            "batch":               i + 1,
+            "interactions":        (i + 1) * BATCH_SIZE,
+            "recall_existing":     m_existing["recall@10"],
+            "precision_existing":  m_existing["precision@10"],
+            "ndcg_existing":       m_existing["ndcg@10"],
+            "recall_new_user":     m_new_user["recall@10"],
+            "precision_new_user":  m_new_user["precision@10"],
+            "ndcg_new_user":       m_new_user["ndcg@10"],
+            "recall_overall":      m_overall["recall@10"],
+            "precision_overall":   m_overall["precision@10"],
+            "ndcg_overall":        m_overall["ndcg@10"],
+            "pct_new_user":            pct_new_user,
+            "n_new_users":             n_new_users,
+            "n_new_user_interactions": n_new_user_interactions,
+            "n_unique_users":          n_unique_users,
+            "window_unique_users":     window_unique_users,
+            "n_users_trained":         n_users_trained,
         })
+
+        if (i + 1) % UPDATE_EVERY == 0:
+            window_active_users = set()
 
         if (i + 1) % 20 == 0:
             print(f"  Batch {i+1:>3}/{n_batches}  "
@@ -217,9 +236,9 @@ def main():
     # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
     # generate plots separately later via --csv <path>.
     if args.csv:
-        plot_new_user_analysis(df, out_png,
-                               f"New User Drift Analysis — {args.dataset} (no retraining)",
-                               batch_size=BATCH_SIZE)
+        plot_new_user_analysis(df, out_png, "New User Analysis",
+                               batch_size=BATCH_SIZE,
+                               subtitle=f"{args.dataset.capitalize()} Dataset")
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     print(f"  Avg recall — existing users: {df['recall_existing'].mean():.4f}")

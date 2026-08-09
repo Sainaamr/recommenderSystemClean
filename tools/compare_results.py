@@ -1,34 +1,51 @@
 """
-Statistically compare two already-saved results CSVs (e.g. no_update vs
-incremental), batch-for-batch, on every metric they have in common.
+Statistically compare two paired sequences of a metric, batch-for-batch.
 
-For each shared metric, reports:
-  - mean gap             : mean(comparison) - mean(baseline)
-  - % improvement        : mean gap as a percentage of the baseline's mean
-  - win rate              : fraction of batches where comparison > baseline
+One purpose-built function per comparison — import and call directly, or
+use the matching CLI subcommand. Add a new function + subcommand here as
+new comparisons come up; each is self-contained.
+
+  compare_no_update_vs_incremental(baseline_csv, comparison_csv, ...)
+      Two results CSVs from run_incremental_lightgcn.py — e.g. no_update vs
+      incremental, same metric column name in both files. Columns are named
+      after the two strategies (mean_no_update, mean_incremental, ...) by
+      default, since the two experiments are genuinely different things,
+      not a generic "baseline"/"comparison" pair.
+
+  compare_new_user_analysis(csv, ...)
+      One results CSV from run_new_user_analysis.py, which has
+      existing/new_user/overall all as separate columns
+      (recall_existing, recall_new_user, recall_overall, ...) in one file.
+      'overall' is the actual reference point here — it's the real blended
+      metric across every user, not an arbitrary third leg — so both
+      'existing' and 'new_user' are reported as gap/% vs 'overall', with
+      all three raw means shown side by side in the same row.
+
+For each metric compared, reports:
+  - mean of each group involved
+  - gap             : mean(group) - mean(reference)
+  - % improvement   : gap as a percentage of the reference's mean
+  - win rate        : fraction of batches where group > reference
   - Wilcoxon signed-rank test (paired, non-parametric) p-value
 
-The two CSVs must share a 'batch' column (they do, if both came from
-run_incremental_lightgcn.py streaming the same realtime file) — rows are
-aligned on 'batch' before comparing, so this remains correct even if one
-file is missing a few batches the other has.
+Rows are always aligned on 'batch' before comparing (an inner merge), so
+mismatched batch counts between two files can't silently misalign the
+pairing.
 
-Usage:
-    python3 tools/compare_results.py \
+CLI usage:
+    python3 tools/compare_results.py no-update-vs-incremental \
         --baseline-csv results/old/yelp_hybrid_results_no_update_20260716_184135.csv \
-        --comparison-csv results/yelp_hybrid_results_incremental_....csv
+        --comparison-csv results/yelp_hybrid_results_incremental_....csv \
+        [--metric recall_at_10] [--out out.csv] [--latex out.tex]
 
-    # restrict to one metric instead of auto-detecting all shared ones
-    python3 tools/compare_results.py --baseline-csv ... --comparison-csv ... \
-        --metric recall_at_10
+    python3 tools/compare_results.py new-user-analysis \
+        --csv results/yelp_new_user_analysis_20260808_200908.csv \
+        [--out out.csv] [--latex out.tex]
 
-    # also save the summary table as a CSV
-    python3 tools/compare_results.py --baseline-csv ... --comparison-csv ... \
-        --out results/no_update_vs_incremental_compare.csv
-
-    # also save it as a formatted LaTeX table
-    python3 tools/compare_results.py --baseline-csv ... --comparison-csv ... \
-        --latex results/no_update_vs_incremental_compare.tex
+Python usage:
+    from tools.compare_results import compare_no_update_vs_incremental, compare_new_user_analysis
+    compare_no_update_vs_incremental("no_update.csv", "incremental.csv")
+    compare_new_user_analysis("new_user_analysis.csv")
 """
 
 import argparse
@@ -45,16 +62,26 @@ sys.path.insert(0, str(ROOT))
 from tools.plot_utils import METRIC_LABELS
 
 
-def compare_metric(df_a: pd.DataFrame, df_b: pd.DataFrame, metric: str) -> dict:
+def compare_columns(df_a: pd.DataFrame, col_a: str, label_a: str,
+                    df_b: pd.DataFrame, col_b: str, label_b: str) -> dict:
     """
-    df_a: baseline, df_b: comparison. Rows aligned on 'batch' before
-    comparing, so mismatched batch counts between the two files can't
-    silently misalign the pairing.
+    Paired comparison between col_a (the reference/baseline) and col_b (the
+    group being compared against it), aligned on 'batch'. df_a and df_b may
+    be the same DataFrame (comparing two columns within one CSV — col_a !=
+    col_b) or two different DataFrames (comparing the same column name
+    across two CSVs — col_a == col_b). Columns are renamed to fixed
+    internal names before merging so both cases work without a name
+    collision either way.
+
+    Returns a dict keyed "mean_{label_a}", "mean_{label_b}", "mean_gap"
+    (b - a), "pct_improvement" (gap as % of a's mean), "win_rate" (fraction
+    of batches where b > a), "wilcoxon_p", "n_batches".
     """
-    merged = pd.merge(df_a[["batch", metric]], df_b[["batch", metric]],
-                      on="batch", suffixes=("_baseline", "_comparison"))
-    a = merged[f"{metric}_baseline"].to_numpy()
-    b = merged[f"{metric}_comparison"].to_numpy()
+    left  = df_a[["batch", col_a]].rename(columns={col_a: "_a"})
+    right = df_b[["batch", col_b]].rename(columns={col_b: "_b"})
+    merged = pd.merge(left, right, on="batch")
+    a = merged["_a"].to_numpy()
+    b = merged["_b"].to_numpy()
 
     mean_gap = b.mean() - a.mean()
     pct_improvement = (mean_gap / a.mean() * 100) if a.mean() != 0 else float("nan")
@@ -68,77 +95,167 @@ def compare_metric(df_a: pd.DataFrame, df_b: pd.DataFrame, metric: str) -> dict:
         p_value = float("nan")
 
     return {
-        "metric":          METRIC_LABELS.get(metric, metric),
-        "n_batches":       len(merged),
-        "mean_baseline":   a.mean(),
-        "mean_comparison": b.mean(),
+        f"mean_{label_a}": a.mean(),
+        f"mean_{label_b}": b.mean(),
         "mean_gap":        mean_gap,
         "pct_improvement": pct_improvement,
         "win_rate":        win_rate,
         "wilcoxon_p":      p_value,
+        "n_batches":       len(merged),
     }
 
 
 def format_for_latex(summary: pd.DataFrame) -> pd.DataFrame:
     """
-    summary: the metric-indexed DataFrame built in main(). Raw floats format
-    badly for a thesis table as-is — mean/gap columns want a fixed decimal
-    count, pct_improvement reads better with a literal '%', and wilcoxon_p
-    rounds to '0.0000' at 4 decimals (these p-values run ~1e-30 to 1e-60),
-    so it gets scientific notation instead. Returns a string-valued
-    DataFrame ready for to_latex(), with 'metric' restored as a plain
-    column instead of the index.
+    summary: a metric-indexed DataFrame as built by the compare_* functions
+    below. Raw floats format badly for a thesis table as-is — mean/gap
+    columns want a fixed decimal count, pct columns read better with a
+    literal '%', and wilcoxon_p rounds to '0.0000' at 4 decimals (these
+    p-values commonly run ~1e-30 to 1e-90), so it gets scientific notation
+    instead. Matches on column-name prefix rather than a fixed column list,
+    since the two compare_* functions produce different column sets.
+    Returns a string-valued DataFrame ready for to_latex(), with the index
+    restored as plain columns.
     """
     df = summary.reset_index()
-    for col in ["mean_baseline", "mean_comparison", "mean_gap"]:
-        df[col] = df[col].map(lambda x: f"{x:.4f}")
-    df["pct_improvement"] = df["pct_improvement"].map(lambda x: f"{x:.2f}\\%")
-    df["win_rate"] = df["win_rate"].map(lambda x: f"{x:.3f}")
-    df["wilcoxon_p"] = df["wilcoxon_p"].map(lambda x: f"{x:.2e}")
+    for col in df.columns:
+        if col == "n_batches" or col == "metric":
+            continue
+        if col.startswith("mean_") or col.startswith("gap_"):
+            df[col] = df[col].map(lambda x: f"{x:.4f}")
+        elif col.startswith("pct_"):
+            df[col] = df[col].map(lambda x: f"{x:.2f}\\%")
+        elif col.startswith("win_rate"):
+            df[col] = df[col].map(lambda x: f"{x:.3f}")
+        elif col.startswith("wilcoxon_p"):
+            df[col] = df[col].map(lambda x: f"{x:.2e}")
     return df
+
+
+def _report(summary: pd.DataFrame, out: Path = None, latex: Path = None):
+    pd.set_option("display.float_format", lambda x: f"{x:.4f}")
+    print(summary.to_string())
+    if out:
+        summary.to_csv(out)
+        print(f"\nSummary saved → {out}")
+    if latex:
+        Path(latex).write_text(format_for_latex(summary).to_latex(index=False))
+        print(f"LaTeX table saved → {latex}")
+
+
+def compare_no_update_vs_incremental(baseline_csv, comparison_csv,
+                                     baseline_label: str = "no_update",
+                                     comparison_label: str = "incremental",
+                                     metric: str = None,
+                                     out: Path = None, latex: Path = None) -> pd.DataFrame:
+    """
+    Compare two results CSVs from run_incremental_lightgcn.py, batch-for-
+    batch, on every metric column they have in common (or just `metric`,
+    if given). baseline_label/comparison_label name the mean columns
+    (mean_{baseline_label}, mean_{comparison_label}) — override them if
+    you're comparing something other than the default no_update/incremental
+    pair (e.g. full_retrain vs incremental).
+    """
+    df_a = pd.read_csv(baseline_csv)
+    df_b = pd.read_csv(comparison_csv)
+
+    metrics = [metric] if metric else [m for m in METRIC_LABELS if m in df_a.columns and m in df_b.columns]
+    if not metrics:
+        raise ValueError("No shared metric columns found between the two CSVs — "
+                         "pass metric= explicitly with a column name present in both.")
+
+    print(f"{baseline_label} (baseline):   {baseline_csv}")
+    print(f"{comparison_label} (comparison): {comparison_csv}\n")
+
+    rows = []
+    for m in metrics:
+        row = compare_columns(df_a, m, baseline_label, df_b, m, comparison_label)
+        row["metric"] = METRIC_LABELS.get(m, m)
+        rows.append(row)
+
+    col_order = [f"mean_{baseline_label}", f"mean_{comparison_label}",
+                "mean_gap", "pct_improvement", "win_rate", "wilcoxon_p", "n_batches"]
+    summary = pd.DataFrame(rows).set_index("metric")[col_order]
+    _report(summary, out, latex)
+    return summary
+
+
+def compare_new_user_analysis(csv, out: Path = None, latex: Path = None) -> pd.DataFrame:
+    """
+    Compare existing/new_user against overall within a single
+    run_new_user_analysis.py results CSV, for every metric that has all
+    three group columns ("{metric}_existing"/"{metric}_new_user"/
+    "{metric}_overall"). 'overall' is the reference point both other groups
+    are measured against — it's the actual blended metric across every
+    user in the batch, so "how far below overall does new_user sit" is the
+    meaningful question, not an arbitrary pairwise combination.
+
+    One row per metric, with all three raw means side by side plus
+    pct_improvement for existing-vs-overall and new_user-vs-overall.
+    """
+    df = pd.read_csv(csv)
+    suffix = "_existing"
+    prefixes = [
+        col[: -len(suffix)] for col in df.columns
+        if col.endswith(suffix)
+        and f"{col[: -len(suffix)]}_new_user" in df.columns
+        and f"{col[: -len(suffix)]}_overall" in df.columns
+    ]
+    if not prefixes:
+        raise ValueError(f"No columns found with existing/new_user/overall suffixes in {csv}.")
+
+    print(f"CSV: {csv}\n")
+
+    rows = []
+    for p in prefixes:
+        existing_cmp = compare_columns(df, f"{p}_overall", "overall", df, f"{p}_existing", "existing")
+        new_user_cmp = compare_columns(df, f"{p}_overall", "overall", df, f"{p}_new_user", "new_user")
+
+        rows.append({
+            "metric":         METRIC_LABELS.get(f"{p}_at_10", p),
+            "mean_existing":  existing_cmp["mean_existing"],
+            "mean_new_user":  new_user_cmp["mean_new_user"],
+            "mean_overall":   existing_cmp["mean_overall"],
+            "pct_existing":   existing_cmp["pct_improvement"],
+            "pct_new_user":   new_user_cmp["pct_improvement"],
+        })
+
+    summary = pd.DataFrame(rows).set_index("metric")
+    _report(summary, out, latex)
+    return summary
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--baseline-csv", type=Path, required=True,
-                        help="Results CSV for the baseline strategy (e.g. no_update)")
-    parser.add_argument("--comparison-csv", type=Path, required=True,
-                        help="Results CSV for the strategy being compared against the baseline")
-    parser.add_argument("--metric", type=str, default=None,
-                        help="Restrict to one metric column; default is every metric "
-                             "column present in both CSVs")
-    parser.add_argument("--out", type=Path, default=None,
-                        help="Save the summary table as a CSV to this path")
-    parser.add_argument("--latex", type=Path, default=None,
-                        help="Save the summary table as a formatted LaTeX table to this path")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p1 = sub.add_parser("no-update-vs-incremental",
+                        help="Compare two results CSVs (e.g. no_update vs incremental)")
+    p1.add_argument("--baseline-csv", type=Path, required=True)
+    p1.add_argument("--comparison-csv", type=Path, required=True)
+    p1.add_argument("--baseline-label", type=str, default="no_update")
+    p1.add_argument("--comparison-label", type=str, default="incremental")
+    p1.add_argument("--metric", type=str, default=None,
+                    help="Restrict to one metric column; default is every shared metric")
+    p1.add_argument("--out", type=Path, default=None)
+    p1.add_argument("--latex", type=Path, default=None)
+
+    p2 = sub.add_parser("new-user-analysis",
+                        help="Compare existing/new_user against overall within one "
+                             "run_new_user_analysis.py CSV")
+    p2.add_argument("--csv", type=Path, required=True)
+    p2.add_argument("--out", type=Path, default=None)
+    p2.add_argument("--latex", type=Path, default=None)
+
     args = parser.parse_args()
 
-    df_a = pd.read_csv(args.baseline_csv)
-    df_b = pd.read_csv(args.comparison_csv)
-
-    if args.metric:
-        metrics = [args.metric]
-    else:
-        metrics = [m for m in METRIC_LABELS if m in df_a.columns and m in df_b.columns]
-        if not metrics:
-            parser.error("No shared metric columns found between the two CSVs — "
-                         "pass --metric explicitly with a column name present in both.")
-
-    print(f"Baseline:   {args.baseline_csv}")
-    print(f"Comparison: {args.comparison_csv}\n")
-
-    rows = [compare_metric(df_a, df_b, m) for m in metrics]
-    summary = pd.DataFrame(rows).set_index("metric")
-    pd.set_option("display.float_format", lambda x: f"{x:.4f}")
-    print(summary.to_string())
-
-    if args.out:
-        summary.to_csv(args.out)
-        print(f"\nSummary saved → {args.out}")
-
-    if args.latex:
-        args.latex.write_text(format_for_latex(summary).to_latex(index=False))
-        print(f"LaTeX table saved → {args.latex}")
+    if args.command == "no-update-vs-incremental":
+        compare_no_update_vs_incremental(args.baseline_csv, args.comparison_csv,
+                                         baseline_label=args.baseline_label,
+                                         comparison_label=args.comparison_label,
+                                         metric=args.metric, out=args.out, latex=args.latex)
+    elif args.command == "new-user-analysis":
+        compare_new_user_analysis(args.csv, out=args.out, latex=args.latex)
 
 
 if __name__ == "__main__":
