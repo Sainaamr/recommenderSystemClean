@@ -450,6 +450,51 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
     plt.close()
 
 
+def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
+                             batch_size: int = 1000, update_every: int = 20):
+    """
+    Interaction-volume counterpart to _plot_new_user_arrivals: same stacked
+    layout (new users at bottom, existing on top), but counting raw
+    interactions instead of unique people. Requires "n_new_user_interactions"
+    (run_new_user_analysis.py only) — every raw interaction row in a batch
+    whose uid is classified as new_user, which unlike a person-count is
+    always safe to sum across any window (an interaction happens once,
+    period — no cross-batch dedup needed the way unique users required).
+    """
+    grouped = (
+        df.assign(chunk=(df["batch"] - 1) // update_every)
+          .groupby("chunk")
+          .agg(n_new_user_interactions=("n_new_user_interactions", "sum"),
+               interactions=("interactions", "max"),
+               n_batches=("batch", "count"))
+    )
+    widths = grouped["n_batches"] * batch_size
+    x = grouped["interactions"] - widths / 2
+    n_existing_interactions = widths - grouped["n_new_user_interactions"]
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(x, grouped["n_new_user_interactions"], width=widths,
+          color="#E69F00", alpha=0.4, edgecolor="#E69F00", linewidth=1.2,
+          label=f"New-user interactions per {update_every} batches")
+    ax.bar(x, n_existing_interactions, width=widths, bottom=grouped["n_new_user_interactions"],
+          color="#0072B2", alpha=0.4, edgecolor="#0072B2", linewidth=1.2,
+          label="Existing-user interactions")
+    ax.set_ylabel("Interactions")
+    ax.set_xlabel("Interactions seen")
+    ax.set_title("Interaction Volume per Update Window")
+    max_x = int(df["interactions"].max())
+    ax.set_xlim(left=0, right=max_x)
+    ax.set_ylim(0, widths.max() * 1.1)  # stacked total — must start at 0
+    _add_end_xtick(ax, max_x)
+    ax.legend(loc="upper left")
+    _center_suptitle_over_axes(fig, ax, title)
+
+    path = Path(f"{base}_interaction_volume.png")
+    plt.savefig(path, dpi=DPI)
+    print(f"Plot saved → {path}")
+    plt.close()
+
+
 def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
                            batch_size: int = 1000, smooth: int = 20,
                            subtitle: str = None, update_every: int = 20):
@@ -512,6 +557,8 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
         plt.close()
 
     _plot_new_user_arrivals(df, base, title, batch_size=batch_size, update_every=update_every)
+    if "n_new_user_interactions" in df.columns:
+        _plot_interaction_volume(df, base, title, batch_size=batch_size, update_every=update_every)
 
 
 
