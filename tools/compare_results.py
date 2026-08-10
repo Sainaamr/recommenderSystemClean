@@ -115,9 +115,12 @@ def format_for_latex(summary: pd.DataFrame) -> pd.DataFrame:
     instead. Matches on column-name prefix rather than a fixed column list,
     since the two compare_* functions produce different column sets.
     Returns a string-valued DataFrame ready for to_latex(), with the index
-    restored as plain columns.
+    restored as plain columns — except a nameless default RangeIndex (e.g.
+    summarize_new_user_windows's single-row summary), which carries no
+    information and would otherwise show up as a meaningless "index" column.
     """
-    df = summary.reset_index()
+    has_real_index = summary.index.name is not None or isinstance(summary.index, pd.MultiIndex)
+    df = summary.reset_index() if has_real_index else summary.copy()
     for col in df.columns:
         if col == "n_batches" or col == "metric":
             continue
@@ -136,7 +139,8 @@ def _report(summary: pd.DataFrame, out: Path = None, latex: Path = None):
     pd.set_option("display.float_format", lambda x: f"{x:.4f}")
     print(summary.to_string())
     if out:
-        summary.to_csv(out)
+        has_real_index = summary.index.name is not None or isinstance(summary.index, pd.MultiIndex)
+        summary.to_csv(out, index=has_real_index)
         print(f"\nSummary saved → {out}")
     if latex:
         Path(latex).write_text(format_for_latex(summary).to_latex(index=False))
@@ -225,6 +229,76 @@ def compare_new_user_analysis(csv, out: Path = None, latex: Path = None) -> pd.D
     return summary
 
 
+def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 1000,
+                               out: Path = None, latex: Path = None) -> pd.DataFrame:
+    """
+    Summarize a run_new_user_analysis.py results CSV at the 20-batch-window
+    level (the same window an incremental update trains on — see
+    tools/plot_utils._plot_new_user_arrivals / _plot_interaction_volume,
+    which this mirrors), averaged across all windows in the run. Two rows,
+    same three columns, one per counting unit:
+
+      "users"        — mean_new/mean_total are people-counts per window.
+                        Requires the "window_unique_users" column (a
+                        running, cross-batch-deduplicated active-user count
+                        reset every update_every batches — see
+                        run_new_user_analysis.py) rather than summing the
+                        per-batch n_unique_users column, which would
+                        double-count users active in more than one batch
+                        within the same window.
+      "interactions" — mean_new/mean_total are raw event counts per
+                        window. Always safe to sum across batches (an
+                        interaction happens once, no dedup needed) — see
+                        n_new_user_interactions in run_new_user_analysis.py.
+
+    pct_new (both rows) is new/total per window, averaged — not computed
+    from the mean_new/mean_total columns — matching how the CSV's own
+    pct_new_user column is already a per-batch mean-of-ratios, not a
+    ratio-of-means.
+    """
+    df = pd.read_csv(csv)
+    required = ["n_new_users", "window_unique_users", "n_new_user_interactions"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"{csv} is missing column(s) {missing} — re-run "
+                         "run_new_user_analysis.py to generate them.")
+
+    grouped = (
+        df.assign(chunk=(df["batch"] - 1) // update_every)
+          .groupby("chunk")
+          .agg(n_new_users=("n_new_users", "sum"),
+               unique_users=("window_unique_users", "max"),
+               n_new_user_interactions=("n_new_user_interactions", "sum"),
+               n_batches=("batch", "count"))
+    )
+    grouped["total_interactions"] = grouped["n_batches"] * batch_size
+    grouped["pct_new_user"] = grouped["n_new_users"] / grouped["unique_users"] * 100
+    grouped["pct_new_user_interactions"] = (
+        grouped["n_new_user_interactions"] / grouped["total_interactions"] * 100
+    )
+
+    print(f"CSV:    {csv}")
+    print(f"Window: {update_every} batches ({grouped['n_batches'].sum()} batches / "
+         f"{len(grouped)} windows)\n")
+
+    summary = pd.DataFrame([
+        {
+            "type":      "users",
+            "mean_new":  grouped["n_new_users"].mean(),
+            "mean_total": grouped["unique_users"].mean(),
+            "pct_new":   grouped["pct_new_user"].mean(),
+        },
+        {
+            "type":      "interactions",
+            "mean_new":  grouped["n_new_user_interactions"].mean(),
+            "mean_total": grouped["total_interactions"].mean(),
+            "pct_new":   grouped["pct_new_user_interactions"].mean(),
+        },
+    ]).set_index("type")
+    _report(summary, out, latex)
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -247,6 +321,14 @@ def main():
     p2.add_argument("--out", type=Path, default=None)
     p2.add_argument("--latex", type=Path, default=None)
 
+    p3 = sub.add_parser("new-user-windows",
+                        help="Summarize a run_new_user_analysis.py CSV at the "
+                             "20-batch-window level (people + interaction counts)")
+    p3.add_argument("--csv", type=Path, required=True)
+    p3.add_argument("--update-every", type=int, default=20)
+    p3.add_argument("--out", type=Path, default=None)
+    p3.add_argument("--latex", type=Path, default=None)
+
     args = parser.parse_args()
 
     if args.command == "no-update-vs-incremental":
@@ -256,6 +338,9 @@ def main():
                                          metric=args.metric, out=args.out, latex=args.latex)
     elif args.command == "new-user-analysis":
         compare_new_user_analysis(args.csv, out=args.out, latex=args.latex)
+    elif args.command == "new-user-windows":
+        summarize_new_user_windows(args.csv, update_every=args.update_every,
+                                   out=args.out, latex=args.latex)
 
 
 if __name__ == "__main__":
