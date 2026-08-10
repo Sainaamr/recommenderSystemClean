@@ -36,7 +36,7 @@ from experiments.run_incremental_lightgcn import (
     DATASET_CONFIGS, RESULTS_DIR, BATCH_SIZE,
     load_id_mappings, build_user_history, train_historical,
 )
-from tools.plot_utils import plot_content_coldstart, _CONTENT_COLDSTART_METRICS
+from tools.plot_utils import plot_content_vs_no_update, _CONTENT_COLDSTART_METRICS
 
 ITEM_META_PATH = "dataset/yelp/yelp.item"
 
@@ -279,6 +279,25 @@ def merge_new_user_baseline(df: pd.DataFrame, new_user_csv: Path) -> pd.DataFram
     return df.merge(baseline, on="batch", how="left")
 
 
+def merge_no_update_overall(df: pd.DataFrame, no_update_csv: Path) -> pd.DataFrame:
+    """
+    Merge in the overall recall/precision/ndcg from a
+    run_incremental_lightgcn.py no_update-strategy results CSV, joined on
+    batch. That script scores everyone together (no existing/new-user
+    split), so this only supplies an aggregate "no update" baseline — use
+    merge_new_user_baseline instead for the existing/new/overall breakdown.
+    """
+    baseline = pd.read_csv(no_update_csv)[[
+        "batch", "recall_at_10", "precision_at_10", "ndcg_at_10",
+    ]]
+    baseline = baseline.rename(columns={
+        "recall_at_10":    "recall_no_update",
+        "precision_at_10": "precision_no_update",
+        "ndcg_at_10":      "ndcg_no_update",
+    })
+    return df.merge(baseline, on="batch", how="left")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -291,6 +310,10 @@ def main():
                         help="A run_new_user_analysis.py results CSV, for the same "
                              "dataset/checkpoint — merged in on 'batch' to provide the "
                              "mean-init baseline for comparison, without recomputing it")
+    parser.add_argument("--no-update-csv", type=Path, default=None,
+                        help="A run_incremental_lightgcn.py no_update-strategy results "
+                             "CSV — merged in on 'batch' to provide the overall no-update "
+                             "baseline for comparison")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
     args = parser.parse_args()
 
@@ -351,15 +374,21 @@ def main():
 
     plot_df = df
     if args.new_user_csv:
-        plot_df = merge_new_user_baseline(df, args.new_user_csv)
+        plot_df = merge_new_user_baseline(plot_df, args.new_user_csv)
         print(f"Merged mean-init baseline from {args.new_user_csv}")
+    if args.no_update_csv:
+        plot_df = merge_no_update_overall(plot_df, args.no_update_csv)
+        print(f"Merged no-update overall baseline from {args.no_update_csv}")
 
     # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
-    # generate plots separately later via --csv <path>.
+    # generate plots separately later via --csv <path>. Each chart family
+    # in plot_content_vs_no_update only renders if its required merged
+    # columns are present, so passing just one of --new-user-csv/
+    # --no-update-csv still produces that family's charts.
     if args.csv:
-        plot_content_coldstart(plot_df, out_png,
-                               "Content-Aware Cold Start — yelp (no retraining)",
-                               batch_size=BATCH_SIZE)
+        plot_content_vs_no_update(plot_df, out_png,
+                                  "Content-Aware Cold Start — yelp (no retraining)",
+                                  subtitle="Yelp Dataset")
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0

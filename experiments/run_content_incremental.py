@@ -449,8 +449,7 @@ def main():
     # generate plots separately later via --csv <path>.
     if args.csv:
         plot_content_coldstart(plot_df, out_png,
-                               "Content-Aware Init + Incremental Update — yelp",
-                               batch_size=BATCH_SIZE)
+                               "Content-Aware Init + Incremental Update — yelp")
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0

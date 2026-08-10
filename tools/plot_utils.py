@@ -376,7 +376,8 @@ def combine_results(csv_paths: list, out_path: Path, title: str,
 
 
 def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
-                            batch_size: int = 1000, update_every: int = 20):
+                            batch_size: int = 1000, update_every: int = 20,
+                            subtitle: str = None):
     """
     New user arrivals per update_every-batch window (i.e. the same window
     an incremental update trains on) rather than per single batch — one bar
@@ -392,6 +393,13 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
     top, so the full bar height reads as "everyone active this window".
     Without that column (e.g. plot_content_coldstart, which doesn't track
     it), only the new-user bar is drawn, same as before.
+
+    subtitle, if given, swaps the usual title arrangement: the descriptive
+    text ("Active Users per Update Window" / "New User Arrivals per Update
+    Window") becomes the suptitle instead of `title`, and `subtitle` becomes
+    the per-axes text underneath (e.g. "Yelp Dataset"). Without it (e.g.
+    plot_content_coldstart's call), the original arrangement is unchanged:
+    `title` is the suptitle, the descriptive text is the per-axes title.
     """
     # Per-chunk width, not a fixed batch_size * update_every: the last chunk
     # is partial whenever the batch count isn't a multiple of update_every
@@ -432,8 +440,8 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
         ax.set_ylabel("Unique new users")
         top_values = grouped["n_new_users"]
     ax.set_xlabel("Interactions seen")
-    ax.set_title("Active Users per Update Window" if has_existing
-                else "New User Arrivals per Update Window")
+    descriptive_title = ("Active Users per Update Window" if has_existing
+                         else "New User Arrivals per Update Window")
     max_x = int(df["interactions"].max())
     ax.set_xlim(left=0, right=max_x)
     y_min, y_max = top_values.min(), top_values.max()
@@ -442,7 +450,12 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
     ax.set_ylim(bottom, y_max + pad)
     _add_end_xtick(ax, max_x)
     ax.legend(loc="upper left")
-    _center_suptitle_over_axes(fig, ax, title)
+    if subtitle:
+        ax.set_title(subtitle)
+        _center_suptitle_over_axes(fig, ax, descriptive_title)
+    else:
+        ax.set_title(descriptive_title)
+        _center_suptitle_over_axes(fig, ax, title)
 
     arrivals_path = Path(f"{base}_new_user_arrivals.png")
     plt.savefig(arrivals_path, dpi=DPI)
@@ -451,7 +464,8 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
 
 
 def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
-                             batch_size: int = 1000, update_every: int = 20):
+                             batch_size: int = 1000, update_every: int = 20,
+                             subtitle: str = None):
     """
     Interaction-volume counterpart to _plot_new_user_arrivals: same stacked
     layout (new users at bottom, existing on top), but counting raw
@@ -460,6 +474,10 @@ def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
     whose uid is classified as new_user, which unlike a person-count is
     always safe to sum across any window (an interaction happens once,
     period — no cross-batch dedup needed the way unique users required).
+
+    subtitle, if given, swaps the usual title arrangement: "Interaction
+    Volume per Update Window" becomes the suptitle instead of `title`, and
+    `subtitle` becomes the per-axes text underneath (e.g. "Yelp Dataset").
     """
     grouped = (
         df.assign(chunk=(df["batch"] - 1) // update_every)
@@ -481,13 +499,17 @@ def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
           label="Existing-user interactions")
     ax.set_ylabel("Interactions")
     ax.set_xlabel("Interactions seen")
-    ax.set_title("Interaction Volume per Update Window")
     max_x = int(df["interactions"].max())
     ax.set_xlim(left=0, right=max_x)
     ax.set_ylim(0, widths.max() * 1.1)  # stacked total — must start at 0
     _add_end_xtick(ax, max_x)
     ax.legend(loc="upper left")
-    _center_suptitle_over_axes(fig, ax, title)
+    if subtitle:
+        ax.set_title(subtitle)
+        _center_suptitle_over_axes(fig, ax, "Interaction Volume per Update Window")
+    else:
+        ax.set_title("Interaction Volume per Update Window")
+        _center_suptitle_over_axes(fig, ax, title)
 
     path = Path(f"{base}_interaction_volume.png")
     plt.savefig(path, dpi=DPI)
@@ -556,34 +578,31 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
         print(f"Plot saved → {path}")
         plt.close()
 
-    _plot_new_user_arrivals(df, base, title, batch_size=batch_size, update_every=update_every)
+    _plot_new_user_arrivals(df, base, title, batch_size=batch_size, update_every=update_every,
+                            subtitle=subtitle)
     if "n_new_user_interactions" in df.columns:
-        _plot_interaction_volume(df, base, title, batch_size=batch_size, update_every=update_every)
+        _plot_interaction_volume(df, base, title, batch_size=batch_size, update_every=update_every,
+                                 subtitle=subtitle)
 
 
 
 # metric key -> (display label, has a mean-init baseline column to compare against)
-# run_new_user_analysis.py only computes recall/precision/ndcg, not hr/mrr, so
-# those two have no mean-init counterpart to merge in or plot.
 _CONTENT_COLDSTART_METRICS = [
     ("recall",    "Recall@10",    True),
     ("precision", "Precision@10", True),
     ("ndcg",      "NDCG@10",      True),
-    ("hr",        "HR@10",        False),
-    ("mrr",       "MRR",          False),
 ]
 
 
-def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
-                           batch_size: int = 1000, smooth: int = 20):
+def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str, smooth: int = 20):
     """
     For every metric in _CONTENT_COLDSTART_METRICS, one PNG comparing new-user
     performance under content-init (and mean-init too, if the corresponding
     *_new_mean column is present — merge it in from a run_new_user_analysis.py
     CSV via --new-user-csv, since that script already computes the identical
     mean-init numbers and recomputing them here would be redundant), and one
-    PNG comparing overall performance, plus the same shared new-user-arrivals
-    and population-growth PNGs used by plot_new_user_analysis.
+    PNG comparing overall performance. No new-user-arrivals chart here — use
+    plot_new_user_analysis's (the stacked new/existing version) instead.
     """
     base = Path(str(out_path).replace(".png", ""))
     x = df["interactions"]
@@ -640,4 +659,98 @@ def plot_content_coldstart(df: pd.DataFrame, out_path: Path, title: str,
         print(f"Plot saved → {path}")
         plt.close()
 
-    _plot_new_user_arrivals(df, base, title, batch_size=batch_size)
+
+def plot_content_vs_no_update(df: pd.DataFrame, out_path: Path, title: str,
+                              subtitle: str = None, smooth: int = 20):
+    """
+    Two families of comparison charts against a frozen (no-update) baseline.
+    Each family only gets drawn if its required columns are present in df
+    (merged in beforehand by the caller — see run_content_coldstart.py's
+    merge_no_update_overall / merge_new_user_baseline):
+
+      "vs_no_update_overall" (needs "{metric}_no_update"): 2 lines — the
+      no_update strategy's own overall recall/precision/ndcg (from a
+      run_incremental_lightgcn.py no_update CSV, which only scores
+      everyone together, no existing/new split) vs content-init's overall
+      performance.
+
+      "vs_no_update_groups" (needs "{metric}_new_mean"/"{metric}_overall_mean",
+      from merge_new_user_baseline): 5 lines — existing (one shared line;
+      verified identical under mean-init and content-init, since only new
+      users' initialization differs between the two), new/overall under
+      mean-init (no update), new/overall under content-init.
+    """
+    base = Path(str(out_path).replace(".png", ""))
+    x = df["interactions"]
+
+    def smoothed(col):
+        return df[col].rolling(smooth, min_periods=1, center=True).mean()
+
+    max_x = int(x.max())
+
+    for metric, ylabel, _ in _CONTENT_COLDSTART_METRICS:
+        # ── vs_no_update_overall: no_update vs content-init, overall only ──
+        if f"{metric}_no_update" in df.columns:
+            fig, ax = plt.subplots(figsize=(12, 5))
+            series = [
+                (f"{metric}_no_update",       COLORS["no_update"],   "No update"),
+                (f"{metric}_overall_content", COLORS["incremental"], "Overall — content init"),
+            ]
+            for col, color, label in series:
+                ax.plot(x, df[col], color=color, alpha=0.2, linewidth=0.8)
+                ax.plot(x, smoothed(col), color=color, linewidth=2, label=label)
+            ax.set_ylabel(ylabel)
+            ax.set_xlabel("Interactions seen")
+            ax.set_xlim(left=0, right=max_x)
+            cols = [c for c, _, _ in series]
+            y_min, y_max = df[cols].stack().quantile(0.01), df[cols].stack().quantile(0.99)
+            pad = (y_max - y_min) * 0.08
+            ax.set_ylim(max(0, y_min - pad), y_max + pad)
+            _add_end_xtick(ax, max_x)
+            ax.legend(loc="upper left")
+            chart_title = "No Update vs Content-Init"
+            if subtitle:
+                ax.set_title(subtitle)
+                _center_suptitle_over_axes(fig, ax, chart_title)
+            else:
+                ax.set_title(chart_title)
+                _center_suptitle_over_axes(fig, ax, title)
+            path = Path(f"{base}_vs_no_update_overall_{metric}.png")
+            plt.savefig(path, dpi=DPI)
+            print(f"Plot saved → {path}")
+            plt.close()
+
+        # ── vs_no_update_groups: existing/new/overall, no_update vs content ─
+        if f"{metric}_new_mean" in df.columns:
+            fig, ax = plt.subplots(figsize=(12, 5))
+            # New and Overall each share one hue across their no-update /
+            # content-init pair — no-update lighter/more transparent,
+            # content-init at full strength — so the pairing reads as "same
+            # group, two strategies" rather than five arbitrary colors.
+            series = [
+                (f"{metric}_existing",        "#2E7D32", "Existing",               1.0),
+                (f"{metric}_new_mean",        "#E69F00", "New — no update",        0.5),
+                (f"{metric}_overall_mean",    "#1F77B4", "Overall — no update",    0.5),
+                (f"{metric}_new_content",     "#E69F00", "New — content init",     1.0),
+                (f"{metric}_overall_content", "#1F77B4", "Overall — content init", 1.0),
+            ]
+            for col, color, label, line_alpha in series:
+                ax.plot(x, df[col], color=color, alpha=0.15, linewidth=0.8)
+                ax.plot(x, smoothed(col), color=color, linewidth=2, label=label, alpha=line_alpha)
+            ax.set_ylabel(ylabel)
+            ax.set_xlabel("Interactions seen")
+            ax.set_xlim(left=0, right=max_x)
+            ax.set_ylim(bottom=0)
+            _add_end_xtick(ax, max_x)
+            ax.legend(loc="upper left", fontsize=9)
+            chart_title = "No Update vs Content-Init by User Group"
+            if subtitle:
+                ax.set_title(subtitle)
+                _center_suptitle_over_axes(fig, ax, chart_title)
+            else:
+                ax.set_title(chart_title)
+                _center_suptitle_over_axes(fig, ax, title)
+            path = Path(f"{base}_vs_no_update_groups_{metric}.png")
+            plt.savefig(path, dpi=DPI)
+            print(f"Plot saved → {path}")
+            plt.close()
