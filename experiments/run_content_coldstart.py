@@ -163,7 +163,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
 
     # Tracks every uid ever classified as "new" so far, so a user whose
     # interactions straddle a batch boundary only counts toward n_new_users
-    # once, at their true first appearance (same fix as run_new_user_analysis.py).
+    # once
     seen_as_new = set()
 
     print(f"\n── Streaming {n_batches} batches (no retraining) ────────────────────")
@@ -186,9 +186,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
             with torch.no_grad():
                 user_emb, item_emb = lgcn.forward()
 
-        # Split this batch's ground truth by existing vs new user — the
-        # classification itself lives here, not inside score_batch, so that
-        # function only has to worry about scoring whatever split it's given.
+        # Split this batch's ground truth by existing vs new user
         existing_gt = {}
         new_user_gt = {}
         for uid, iid in zip(batch_users, batch_items):
@@ -209,11 +207,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
         pct_new_users = n_new_users / max(len(set(batch_users)), 1)
 
         # Accumulate this batch's items into each new user's content profile,
-        # and update history — both AFTER scoring, not before, so a user's
-        # cold-start embedding this batch is built only from strictly prior
-        # interactions, never from the same items being scored as ground
-        # truth in this batch (would otherwise leak the answer into the
-        # profile used to predict it).
+        # and update history
         for uid, iid in zip(batch_users, batch_items):
             if uid >= n_users_trained:
                 new_user_first_items.setdefault(uid, [])
@@ -254,14 +248,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
 
 def merge_new_user_baseline(df: pd.DataFrame, new_user_csv: Path) -> pd.DataFrame:
     """
-    Merge in the mean-init baseline (recall/precision/ndcg for new users and
-    overall) from a run_new_user_analysis.py results CSV, joined on batch.
-    Both scripts stream the exact same frozen checkpoint over the exact same
-    realtime data with no training and no other randomness, so their
-    existing/new-user classification and mean-init numbers are
-    deterministically identical batch-for-batch — this reuses that output
-    instead of recomputing it. run_new_user_analysis.py doesn't compute
-    hr/mrr, so those have no mean-init counterpart to merge in.
+    Merge in the mean-init baseline
     """
     baseline = pd.read_csv(new_user_csv)[[
         "batch",
@@ -344,10 +331,7 @@ def main():
 
         print("\n── Running content cold-start experiment ────────────────────────────")
         # Measures the cost of the whole cold-start run (content-index
-        # build/load + per-batch scoring over all streaming batches) — there's
-        # no retraining here, so unlike run_incremental_lightgcn.py there's
-        # only one emissions figure for the whole streaming loop, not a
-        # per-update one.
+        # build/load + per-batch scoring over all streaming batches)
         tracker = EmissionsTracker(
             project_name=f"content_coldstart_{args.dataset}",
             output_dir=str(results_dir),
@@ -357,7 +341,6 @@ def main():
         tracker.start()
         df = run_content_coldstart(cfg, ckpt)
         # tracker.stop() returns CO2 emissions in kg, not energy; *1e6
-        # converts kg -> mg, matching the mg CO2eq convention used elsewhere.
         kg_co2 = tracker.stop() or 0.0
         streaming_emissions_mg = kg_co2 * 1e6
         print(f"  Content cold-start streaming emissions: {streaming_emissions_mg:.4f} mg CO2eq")
@@ -380,11 +363,7 @@ def main():
         plot_df = merge_no_update_overall(plot_df, args.no_update_csv)
         print(f"Merged no-update overall baseline from {args.no_update_csv}")
 
-    # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
-    # generate plots separately later via --csv <path>. Each chart family
-    # in plot_content_vs_no_update only renders if its required merged
-    # columns are present, so passing just one of --new-user-csv/
-    # --no-update-csv still produces that family's charts.
+
     if args.csv:
         plot_content_vs_no_update(plot_df, out_png,
                                   "Content-Aware Cold Start — yelp (no retraining)",

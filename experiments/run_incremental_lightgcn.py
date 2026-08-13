@@ -43,7 +43,6 @@ from recbole.data import create_dataset
 
 from src.models.incremental_lightgcn import IncrementalLightGCN
 from src.evaluation.metrics import batch_metrics_lgcn
-from tools.plot_utils import plot_streaming_results
 
 # ── Parameters ───────────────────────────────────────────────────────────────
 BATCH_SIZE    = 1000
@@ -62,24 +61,16 @@ DATASET_CONFIGS = {
         "historical_path":  "dataset/ml-1m-historical/ml-1m-historical.inter",
         "realtime_path":    "dataset/ml-1m-realtime/ml-1m-realtime.inter",
         "config_files":     ["configs/dataset.yaml", "configs/historical_eval.yaml", "configs/lightgcn.yaml"],
-        "checkpoint":           "saved/compatible/LightGCN-ml1m-historical.pth",
-        "itemknn_checkpoint":   "saved/compatible/ItemKNN-ml1m-historical.pkl",
-        "results_csv":          RESULTS_DIR / "ml1m_hybrid_results.csv",
-        "results_png":          RESULTS_DIR / "ml1m_hybrid_curves.png",
-        "id_cast":              lambda x: str(int(x)),
-        "plot_title":           "Incremental LightGCN vs No Update\n(ml-1m streaming, batch size=1000)",
+        "checkpoint":       "saved/compatible/LightGCN-ml1m-historical.pth",
+        "id_cast":          lambda x: str(int(x)),
     },
     "yelp": {
-        "dataset":              "yelp-historical",
-        "historical_path":      "dataset/yelp-historical/yelp-historical.inter",
-        "realtime_path":        "dataset/yelp-realtime/yelp-realtime.inter",
-        "config_files":         ["configs/yelp_dataset.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
-        "checkpoint":           "saved/compatible/LightGCN-yelp-historical.pth",
-        "itemknn_checkpoint":   "saved/compatible/ItemKNN-yelp-historical.pkl",
-        "results_csv":          RESULTS_DIR / "yelp_hybrid_results.csv",
-        "results_png":          RESULTS_DIR / "yelp_hybrid_curves.png",
-        "id_cast":              lambda x: str(x),
-        "plot_title":           "Incremental LightGCN vs No Update\n(yelp streaming, batch size=1000)",
+        "dataset":          "yelp-historical",
+        "historical_path":  "dataset/yelp-historical/yelp-historical.inter",
+        "realtime_path":    "dataset/yelp-realtime/yelp-realtime.inter",
+        "config_files":     ["configs/yelp_dataset.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":       "saved/compatible/LightGCN-yelp-historical.pth",
+        "id_cast":          lambda x: str(x),
     },
 }
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,17 +214,9 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
       - no_update:    embeddings expanded with mean init (so they can be scored)
                       but graph and weights never updated
       - full_retrain: every update_every batches, retrains LightGCN from
-                      scratch (not warm-started) via RecBole (run_recbole),
+                      scratch  via RecBole
                       on all historical + realtime interactions consumed so
                       far — the recall/energy "ceiling" comparison point.
-                      Unlike the other two, IDs are looked up per-batch
-                      (not grown/precomputed upfront), because a RecBole
-                      retrain can renumber IDs — its user_inter_num_interval
-                      / item_inter_num_interval filters re-evaluate against
-                      the whole combined dataset each retrain, so which IDs
-                      even qualify can change. New users/items not yet
-                      incorporated by the most recent retrain are skipped
-                      from evaluation until the next retrain absorbs them.
     """
     print(f"\nRunning strategy: {strategy}")
     # get info from config file
@@ -401,11 +384,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                 assert checkpoints, "No LightGCN checkpoint found after full retrain"
                 raw_ckpt_path = checkpoints[-1]
 
-                # Move out of the generic saved/LightGCN-*.pth pool (shared
-                # with historical training) into a dedicated, clearly-labeled
-                # location — so full_retrain's periodic snapshots never get
-                # confused with the historical starting checkpoint, and stay
-                # organized per-dataset and per-batch instead of piling
+
                 retrain_dir = Path("saved/full_retrain") / cfg["dataset"]
                 retrain_dir.mkdir(parents=True, exist_ok=True)
                 ckpt_path = retrain_dir / f"batch_{i + 1:04d}.pth"
@@ -447,13 +426,6 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
     return pd.DataFrame(records)
 
 
-# Step 6: Plot results
-
-def plot_results(df: pd.DataFrame, cfg: dict, training_emissions_mg: float = None):
-    plot_streaming_results(df, cfg["results_png"], cfg["plot_title"], UPDATE_EVERY,
-                           training_emissions_mg=training_emissions_mg)
-
-
 # Main
 
 STRATEGIES = ["no_update", "incremental", "full_retrain"]
@@ -484,9 +456,6 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Stamp output filenames with a shared timestamp, so runs never overwrite
-    # each other. Each requested strategy gets its OWN separate results CSV
-    # (not merged into one combined file) — use tools.plot_utils.combine_results
-    # afterward to load two or more of these CSVs together and plot them.
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_prefix = args.dataset.replace("-", "")
     print(f"Run timestamp: {ts}")
@@ -495,10 +464,10 @@ def main():
     checkpoint, training_emissions_mg = train_historical(cfg)
 
     # Step 2: Run each requested strategy, each starting from a fresh copy
-    # of the same historical checkpoint (so strategies are directly
-    # comparable, none of them chain off another's updated weights).
+    # of the same historical checkpoint
     dfs = {}
     csv_paths = {}
+    streaming_emissions_mg = {}
     for strategy in STRATEGIES:
         if not run_flags[strategy]:
             continue
@@ -506,8 +475,23 @@ def main():
         user2id, item2id, config, dataset = load_id_mappings(cfg)
         model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
         user_history = build_user_history(user2id, item2id, cfg)
+
+        # Whole-run tracker (scoring + updates together), matching the
+        # convention in run_content_coldstart.py / run_content_incremental.py
+        # — makes their streaming_emissions_mg directly comparable to this
+        # one, unlike {strategy}_total_emissions_mg below, which only sums
+        # the update steps and excludes per-batch scoring cost.
+        tracker = EmissionsTracker(
+            project_name=f"streaming_{strategy}_{args.dataset}",
+            output_dir=str(results_dir),
+            log_level="error",
+            save_to_file=False,
+        )
+        tracker.start()
         df = run_streaming(model, user2id, item2id, user_history,
                            strategy=strategy, cfg=cfg)
+        kg_co2 = tracker.stop() or 0.0
+        streaming_emissions_mg[strategy] = kg_co2 * 1e6
         dfs[strategy] = df
 
         # Step 3: Save each strategy's results to its own CSV immediately
@@ -516,17 +500,9 @@ def main():
         csv_paths[strategy] = strategy_csv
         print(f"Results saved → {strategy_csv}")
 
-    # Historical training emissions are only otherwise persisted in the
-    # gitignored saved/*.energy.json sidecar — mirror it into results/
-    # (git-tracked) so it survives independently of the checkpoint. Shared
-    # across all strategies run in this invocation, since training cost is
-    # tied to the checkpoint, not to any individual strategy. Each updating
-    # strategy's total ongoing emissions (summed from its own
-    # update_emissions_mg column) is included alongside it, so this one CSV
-    # captures both the one-time and cumulative ongoing costs for the run —
-    # no_update is skipped since it never updates and would just be 0.
     energy_row = {"training_emissions_mg": training_emissions_mg}
     for strategy, df in dfs.items():
+        energy_row[f"{strategy}_streaming_emissions_mg"] = streaming_emissions_mg[strategy]
         if strategy == "no_update":
             continue
         total_emissions = df["update_emissions_mg"].sum()

@@ -45,7 +45,7 @@ from experiments.run_incremental_lightgcn import (
     load_id_mappings, build_user_history, train_historical,
 )
 from experiments.run_content_coldstart import ITEM_META_PATH, merge_new_user_baseline
-from tools.plot_utils import plot_content_coldstart, _CONTENT_COLDSTART_METRICS
+from tools.plot_utils import plot_content_incremental_groups, _CONTENT_COLDSTART_METRICS
 
 
 # Per-batch scoring
@@ -412,11 +412,7 @@ def main():
         ckpt, training_emissions_mg = train_historical(cfg)
 
         print("\n── Running content-init + incremental update experiment ─────────────")
-        # Aggregate figure for the whole run (content-index build/load + all
-        # batches' scoring/refresh/updates). The per-batch update_emissions_mg
-        # column already isolates just the incremental_update cost, matching
-        # run_incremental_lightgcn.py's convention exactly for direct
-        # comparability against the pure "incremental" strategy's results.
+
         tracker = EmissionsTracker(
             project_name=f"content_incremental_{args.dataset}",
             output_dir=str(results_dir),
@@ -448,8 +444,8 @@ def main():
     # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
     # generate plots separately later via --csv <path>.
     if args.csv:
-        plot_content_coldstart(plot_df, out_png,
-                               "Content-Aware Init + Incremental Update — yelp")
+        plot_content_incremental_groups(plot_df, out_png, "Content Incremental",
+                                        subtitle="Yelp Dataset")
 
     print(f"\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0
