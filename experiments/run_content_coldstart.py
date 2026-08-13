@@ -94,7 +94,7 @@ def score_batch(user_emb, item_emb, existing_gt, new_user_gt, history,
 cfg: dataset configuration
 ckpt: trained lightgcn checkpoint
 """
-def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
+def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
     user2id, item2id, config, dataset = load_id_mappings(cfg)
     lgcn = IncrementalLightGCN.from_checkpoint(ckpt, config, dataset)
     history = build_user_history(user2id, item2id, cfg)
@@ -114,7 +114,16 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
     if cache_path.exists():
         print(f"Found existing content-index cache: {cache_path}")
         content_init = ContentUserInitializer.load(str(cache_path))
+        # No build happened — nothing to measure.
+        content_build_emissions_mg = 0.0
     else:
+        build_tracker = EmissionsTracker(
+            project_name="content_index_build",
+            output_dir=str(RESULTS_DIR),
+            log_level="error",
+            save_to_file=False,
+        )
+        build_tracker.start()
         content_init = ContentUserInitializer(alpha=0.7, top_k=20, geo_precision=geo_precision)
         content_init.build(
             item_meta_path        = ITEM_META_PATH,
@@ -125,6 +134,9 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
             user_emb              = user_emb.cpu().numpy(),
         )
         content_init.save(str(cache_path))
+        kg_co2_build = build_tracker.stop() or 0.0
+        content_build_emissions_mg = kg_co2_build * 1e6
+        print(f"  Content index build emissions: {content_build_emissions_mg:.4f} mg CO2eq")
 
     # realtime_path
     df_rt = pd.read_csv(cfg["realtime_path"], sep="\t")
@@ -243,7 +255,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> pd.DataFrame:
                   f"new_content={m_new_content['recall@10']:.4f}  "
                   f"n_new={n_new_users}")
 
-    return pd.DataFrame(records)
+    return pd.DataFrame(records), content_build_emissions_mg
 
 
 def merge_new_user_baseline(df: pd.DataFrame, new_user_csv: Path) -> pd.DataFrame:
@@ -320,18 +332,21 @@ def main():
         energy_path = Path(str(args.csv).replace(".csv", "_energy.csv"))
         if energy_path.exists():
             emissions = pd.read_csv(energy_path).iloc[0]
-            training_emissions_mg  = emissions.get("training_emissions_mg", 0.0)
-            streaming_emissions_mg = emissions.get("streaming_emissions_mg", 0.0)
+            training_emissions_mg      = emissions.get("training_emissions_mg", 0.0)
+            streaming_emissions_mg     = emissions.get("streaming_emissions_mg", 0.0)
+            content_build_emissions_mg = emissions.get("content_build_emissions_mg", 0.0)
         else:
             print("  (no emissions sidecar found for this CSV — energy unknown)")
-            training_emissions_mg = streaming_emissions_mg = 0.0
+            training_emissions_mg = streaming_emissions_mg = content_build_emissions_mg = 0.0
     else:
         print("\n── Loading LightGCN checkpoint ──────────────────────────────────────")
         ckpt, training_emissions_mg = train_historical(cfg)
 
         print("\n── Running content cold-start experiment ────────────────────────────")
         # Measures the cost of the whole cold-start run (content-index
-        # build/load + per-batch scoring over all streaming batches)
+        # build/load + per-batch scoring over all streaming batches) — this
+        # already includes content_build_emissions_mg when a build happens,
+        # same convention as run_content_incremental.py.
         tracker = EmissionsTracker(
             project_name=f"content_coldstart_{args.dataset}",
             output_dir=str(results_dir),
@@ -339,7 +354,7 @@ def main():
             save_to_file=False,
         )
         tracker.start()
-        df = run_content_coldstart(cfg, ckpt)
+        df, content_build_emissions_mg = run_content_coldstart(cfg, ckpt)
         # tracker.stop() returns CO2 emissions in kg, not energy; *1e6
         kg_co2 = tracker.stop() or 0.0
         streaming_emissions_mg = kg_co2 * 1e6
@@ -350,8 +365,9 @@ def main():
 
         energy_path = Path(str(out_csv).replace(".csv", "_energy.csv"))
         pd.DataFrame([{
-            "training_emissions_mg":  training_emissions_mg,
-            "streaming_emissions_mg": streaming_emissions_mg,
+            "training_emissions_mg":      training_emissions_mg,
+            "streaming_emissions_mg":     streaming_emissions_mg,
+            "content_build_emissions_mg": content_build_emissions_mg,
         }]).to_csv(energy_path, index=False)
         print(f"Emissions saved → {energy_path}")
 
@@ -389,6 +405,7 @@ def main():
         print("  (pass --new-user-csv <run_new_user_analysis.py CSV> for a mean-init comparison)")
 
     print(f"  Historical training emissions:       {training_emissions_mg:.4f} mg CO2eq")
+    print(f"  Content index build emissions:       {content_build_emissions_mg:.4f} mg CO2eq  (one-time)")
     print(f"  Content cold-start emissions:        {streaming_emissions_mg:.4f} mg CO2eq")
     print(f"  Total emissions:                     {training_emissions_mg + streaming_emissions_mg:.4f} mg CO2eq")
 

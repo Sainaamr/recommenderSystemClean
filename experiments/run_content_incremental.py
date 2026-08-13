@@ -428,11 +428,21 @@ def main():
         df.to_csv(out_csv, index=False)
         print(f"\nResults saved → {out_csv}")
 
+        # Aggregated from the already-measured per-batch columns — same
+        # values the console summary below prints, now persisted too.
+        n_updates              = int(df["updated"].sum())
+        total_update_emissions = df["update_emissions_mg"].sum()
+        total_seed_emissions   = df["content_seed_emissions_mg"].sum()
+
         energy_path = Path(str(out_csv).replace(".csv", "_energy.csv"))
         pd.DataFrame([{
-            "training_emissions_mg":      training_emissions_mg,
-            "streaming_emissions_mg":     streaming_emissions_mg,
-            "content_build_emissions_mg": content_build_emissions_mg,
+            "training_emissions_mg":       training_emissions_mg,
+            "streaming_emissions_mg":      streaming_emissions_mg,
+            "content_build_emissions_mg":  content_build_emissions_mg,
+            "total_update_emissions_mg":   total_update_emissions,
+            "n_updates":                   n_updates,
+            "avg_emissions_per_update_mg": total_update_emissions / max(n_updates, 1),
+            "total_seed_emissions_mg":     total_seed_emissions,
         }]).to_csv(energy_path, index=False)
         print(f"Emissions saved → {energy_path}")
 
