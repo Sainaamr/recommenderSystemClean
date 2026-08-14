@@ -1,9 +1,12 @@
 """
 Content-aware cold-start experiment for new users.
 
-Compares two initialization strategies for new users arriving during streaming:
-  mean_init    : global mean of all trained user embeddings (current baseline)
-  content_init : weighted average of geo+category similar trained users
+New users get a content-based embedding (ContentUserInitializer) written
+once into a persistent row in the embedding table — the same mechanism
+run_content_incremental.py uses, minus the periodic gradient update. Once
+seeded, a user's row is never touched again for the rest of the run.
+Existing and new users are scored identically, by reading directly from
+that table.
 
 LightGCN is never retrained.
 
@@ -41,52 +44,50 @@ from tools.plot_utils import plot_content_vs_no_update, _CONTENT_COLDSTART_METRI
 ITEM_META_PATH = "dataset/yelp/yelp.item"
 
 
-# Per-batch scoring 
+# Per-batch scoring
 
-def score_batch(user_emb, item_emb, existing_gt, new_user_gt, history,
-                content_init: ContentUserInitializer, new_user_first_items: dict,
-                k: int = 10):
+def score_batch(user_emb, item_emb, existing_gt, new_user_gt, history, k: int = 10):
     """
-    Scores existing users once, and new users once under content-aware
-    init — built from their first interactions so far.
-
-    Combine this script's output with a run_new_user_analysis.py
-
-    new_user_first_items : uid → list of item identifiers seen so far
-    (updated externally) — each entry is either an iid (int, a trained item)
-    or a raw item token (str, an item excluded from training but still
-    content-matchable); see ContentUserInitializer.get_embedding().
+    Scores existing AND new users the same way — reading directly from the
+    embedding table row, matching run_content_incremental.py's score_batch.
+    No inline recomputation here; whatever was last written to a user's row
+    (mean-init or content-seeded) is what gets scored.
 
     Returns (m_existing, m_new_content, m_overall_content) — each an
-    _avg()-averaged metrics dict (recall@k, precision@k, ndcg@k, ...), same
-    shape batch_metrics_lgcn returns.
+    _avg()-averaged metrics dict (recall@k, precision@k, ndcg@k, ...).
     """
-    def score_uid(uid, gt, user_vec):
-        #    translate to torch from numpy for content user init
-        user_vec_t = torch.as_tensor(user_vec, dtype=item_emb.dtype, device=item_emb.device)
-        scores = torch.matmul(user_vec_t, item_emb.T).cpu().numpy()
+    def score_uid(uid, gt):
+        scores = torch.matmul(user_emb[uid], item_emb.T).cpu().numpy()
         return compute_metrics_at_ks(scores, gt, history.get(uid, set()), (k,))
 
-    # scoring existing users
-    existing_results = [
-        score_uid(uid, gt, user_emb[uid])
-        for uid, gt in existing_gt.items() if uid < user_emb.shape[0]
-    ]
-
-    # scoring new users
-    new_content_results = []
-    for uid, gt in new_user_gt.items():
-        if uid >= user_emb.shape[0]:
-            continue
-        iids_so_far = new_user_first_items.get(uid, [])
-        content_emb = content_init.get_embedding(iids_so_far)
-        new_content_results.append(score_uid(uid, gt, content_emb))
-
+    existing_results = [score_uid(uid, gt) for uid, gt in existing_gt.items() if uid < user_emb.shape[0]]
+    new_results      = [score_uid(uid, gt) for uid, gt in new_user_gt.items() if uid < user_emb.shape[0]]
     return (
         _avg(existing_results),
-        _avg(new_content_results),
-        _avg(existing_results + new_content_results),
+        _avg(new_results),
+        _avg(existing_results + new_results),
     )
+
+
+def _apply_content_seeds_once(lgcn: IncrementalLightGCN, content_init: ContentUserInitializer,
+                              accumulated_items: dict, content_seeded: set) -> int:
+    """
+    One-time content seed: for every still-unseeded uid with accumulated
+    history, write a content-based embedding into their row exactly once.
+    No gradient training exists in this script, so once seeded, a row is
+    never touched again for the rest of the run.
+    """
+    seed = {}
+    for uid, items in accumulated_items.items():
+        if uid in content_seeded:
+            continue
+        if not items:
+            continue
+        seed[uid] = content_init.get_embedding(items)
+        content_seeded.add(uid)
+    if seed:
+        lgcn.set_user_embeddings(seed)
+    return len(seed)
 
 
 # Streaming loop
@@ -138,62 +139,87 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
         content_build_emissions_mg = kg_co2_build * 1e6
         print(f"  Content index build emissions: {content_build_emissions_mg:.4f} mg CO2eq")
 
-    # realtime_path
-    df_rt = pd.read_csv(cfg["realtime_path"], sep="\t")
-
-    id_cast  = cfg["id_cast"]
+    id_cast = cfg["id_cast"]
     next_uid = [lgcn.n_users]
     next_iid = [lgcn.n_items]
-
-    # uid → list of iids seen so far, used to build each new user's content
-    # embedding.
-    new_user_first_items: dict = {}
-    # to asignnew id for new users
-    def get_uid(x):
-        key = id_cast(x)
-        if key not in user2id:
-            new_uid = next_uid[0]
-            user2id[key] = new_uid
-            next_uid[0] += 1
-            # check if this user has any prior history that model wasnt trained on
-            hist_items = content_init.get_excluded_history(key)
-            if hist_items:
-                new_user_first_items[new_uid] = list(hist_items)
-        return user2id[key]
-    # to asign id for new items
-    def get_iid(x):
-        key = id_cast(x)
-        if key not in item2id:
-            item2id[key] = next_iid[0]; next_iid[0] += 1
-        return item2id[key]
-
-    df_rt["uid"] = df_rt["user_id:token"].apply(get_uid).astype(int)
-    df_rt["iid"] = df_rt["item_id:token"].apply(get_iid).astype(int)
-
+    df_rt = pd.read_csv(cfg["realtime_path"], sep="\t")
     n_batches = len(df_rt) // BATCH_SIZE
-    records   = []
 
-    # Tracks every uid ever classified as "new" so far, so a user whose
-    # interactions straddle a batch boundary only counts toward n_new_users
-    # once
-    seen_as_new = set()
+    # uid -> accumulated item list, in ContentUserInitializer.get_embedding()'s
+    # native mixed format (int iid for trained items, str token for items
+    # that were themselves excluded from training)
+    accumulated_items: dict = {}
+    content_seeded: set = set()   # uids that have already received their one-time content seed
+    seen_as_new: set = set()      # every uid ever classified as "new" so far
+    records = []
 
-    print(f"\n── Streaming {n_batches} batches (no retraining) ────────────────────")
+    print(f"\n── Streaming {n_batches} batches (content-init, no retraining) ───────")
 
     for i in range(n_batches):
-        batch       = df_rt.iloc[i * BATCH_SIZE:(i + 1) * BATCH_SIZE]
+        batch = df_rt.iloc[i * BATCH_SIZE:(i + 1) * BATCH_SIZE].copy()
+
+        newly_arrived = []  # (uid, raw_token)
+
+        def get_uid(x):
+            key = id_cast(x)
+            if key not in user2id:
+                uid = next_uid[0]
+                user2id[key] = uid
+                next_uid[0] += 1
+                newly_arrived.append((uid, key))
+            return user2id[key]
+
+        def get_iid(x):
+            key = id_cast(x)
+            if key not in item2id:
+                item2id[key] = next_iid[0]
+                next_iid[0] += 1
+            return item2id[key]
+
+        batch["uid"] = batch["user_id:token"].apply(get_uid).astype(int)
+        batch["iid"] = batch["item_id:token"].apply(get_iid).astype(int)
         batch_users = batch["uid"].tolist()
         batch_items = batch["iid"].tolist()
 
-        # Expand so new users get mean embeddings (baseline path)
+        content_seed_this_batch = {}
+        promoted_iids_this_batch = []  # excluded-history items promoted to real iids
+
+        recovered_seed_tracker = EmissionsTracker(
+            project_name=f"content_seed_recovered_batch_{i}",
+            output_dir=str(RESULTS_DIR),
+            log_level="error",
+            save_to_file=False,
+        )
+        recovered_seed_tracker.start()
+        for uid, u_tok in newly_arrived:
+            hist_items = content_init.get_excluded_history(u_tok)
+            if not hist_items:
+                continue  # no recovered history -> mean-init fallback
+
+            promoted = []
+            for item_key in hist_items:
+                if isinstance(item_key, str):
+                    if item_key not in item2id:
+                        item2id[item_key] = next_iid[0]
+                        next_iid[0] += 1
+                    promoted.append(item2id[item_key])
+                else:
+                    promoted.append(item_key)
+            promoted_iids_this_batch.extend(promoted)
+
+            content_seed_this_batch[uid] = content_init.get_embedding(hist_items)
+            accumulated_items[uid] = list(hist_items)
+            content_seeded.add(uid)
+        kg_co2_recovered_seed = recovered_seed_tracker.stop() or 0.0
+
         max_u = max(batch_users, default=0)
-        max_i = max(batch_items, default=0)
+        max_i = max(batch_items + promoted_iids_this_batch, default=0)
         if max_u >= lgcn.n_users or max_i >= lgcn.n_items:
-            lgcn.expand_embeddings(
+            lgcn.expand_embeddings_content(
                 max(max_u + 1, lgcn.n_users),
                 max(max_i + 1, lgcn.n_items),
+                content_seed_this_batch,
             )
-            # Refresh embeddings after expansion
             lgcn.eval()
             with torch.no_grad():
                 user_emb, item_emb = lgcn.forward()
@@ -208,24 +234,33 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
                 existing_gt.setdefault(uid, set()).add(iid)
 
         m_existing, m_new_content, m_overall_content = score_batch(
-            user_emb, item_emb, existing_gt, new_user_gt,
-            history, content_init, new_user_first_items,
-        )
+            user_emb, item_emb, existing_gt, new_user_gt, history)
 
         new_user_set = set(new_user_gt.keys())
-        first_time_new = new_user_set - seen_as_new
+        n_new_users = len(new_user_set - seen_as_new)
         seen_as_new |= new_user_set
-        n_new_users = len(first_time_new)
         pct_new_users = n_new_users / max(len(set(batch_users)), 1)
 
-        # Accumulate this batch's items into each new user's content profile,
-        # and update history
+        # After scoring only: update history, and grow accumulated_items for
+        # new users (their content embedding, if not yet seeded, gets built
+        # from this once they're picked up by _apply_content_seeds_once below).
         for uid, iid in zip(batch_users, batch_items):
-            if uid >= n_users_trained:
-                new_user_first_items.setdefault(uid, [])
-                if iid not in new_user_first_items[uid]:
-                    new_user_first_items[uid].append(iid)
             history.setdefault(uid, set()).add(iid)
+            if uid >= n_users_trained:
+                accumulated_items.setdefault(uid, [])
+                if iid not in accumulated_items[uid]:
+                    accumulated_items[uid].append(iid)
+
+        seed_tracker = EmissionsTracker(
+            project_name=f"content_seed_batch_{i}",
+            output_dir=str(RESULTS_DIR),
+            log_level="error",
+            save_to_file=False,
+        )
+        seed_tracker.start()
+        _apply_content_seeds_once(lgcn, content_init, accumulated_items, content_seeded)
+        kg_co2_seed = seed_tracker.stop() or 0.0
+        content_seed_emissions_mg = (kg_co2_recovered_seed + kg_co2_seed) * 1e6
 
         records.append({
             "batch":                     i + 1,
@@ -248,6 +283,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             "n_new_users":               n_new_users,
             "pct_new_users":             pct_new_users,
             "n_users_trained":           n_users_trained,
+            "content_seed_emissions_mg": content_seed_emissions_mg,
         })
 
         if (i + 1) % 20 == 0:
@@ -338,6 +374,7 @@ def main():
         else:
             print("  (no emissions sidecar found for this CSV — energy unknown)")
             training_emissions_mg = streaming_emissions_mg = content_build_emissions_mg = 0.0
+        total_seed_emissions = df["content_seed_emissions_mg"].sum() if "content_seed_emissions_mg" in df.columns else 0.0
     else:
         print("\n── Loading LightGCN checkpoint ──────────────────────────────────────")
         ckpt, training_emissions_mg = train_historical(cfg)
@@ -363,11 +400,14 @@ def main():
         df.to_csv(out_csv, index=False)
         print(f"\nResults saved → {out_csv}")
 
+        total_seed_emissions = df["content_seed_emissions_mg"].sum()
+
         energy_path = Path(str(out_csv).replace(".csv", "_energy.csv"))
         pd.DataFrame([{
             "training_emissions_mg":      training_emissions_mg,
             "streaming_emissions_mg":     streaming_emissions_mg,
             "content_build_emissions_mg": content_build_emissions_mg,
+            "total_seed_emissions_mg":    total_seed_emissions,
         }]).to_csv(energy_path, index=False)
         print(f"Emissions saved → {energy_path}")
 
@@ -406,6 +446,7 @@ def main():
 
     print(f"  Historical training emissions:       {training_emissions_mg:.4f} mg CO2eq")
     print(f"  Content index build emissions:       {content_build_emissions_mg:.4f} mg CO2eq  (one-time)")
+    print(f"  Total content-seeding emissions:     {total_seed_emissions:.4f} mg CO2eq  (every batch)")
     print(f"  Content cold-start emissions:        {streaming_emissions_mg:.4f} mg CO2eq")
     print(f"  Total emissions:                     {training_emissions_mg + streaming_emissions_mg:.4f} mg CO2eq")
 

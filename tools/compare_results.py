@@ -102,6 +102,10 @@ def format_for_latex(summary: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].map(lambda x: f"{x:.3f}")
         elif col.startswith("wilcoxon_p"):
             df[col] = df[col].map(lambda x: f"{x:.2e}")
+        elif col.endswith("_mg"):
+            df[col] = df[col].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "--")
+        elif col == "n_updates":
+            df[col] = df[col].map(lambda x: f"{int(x)}")
     return df
 
 
@@ -437,6 +441,69 @@ def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 10
     return summary
 
 
+def compare_energy_summary(no_update_csv, incremental_csv,
+                           content_coldstart_csv, content_incremental_csv,
+                           out: Path = None, latex: Path = None) -> pd.DataFrame:
+    """
+    Builds one energy/emissions row per run — no_update and incremental
+    (from a run_incremental_lightgcn.py "*_hybrid_emissions_summary" CSV,
+    "{strategy}_"-prefixed columns) and content_coldstart /
+    content_incremental (from their own "*_energy.csv" sidecars, flat
+    column names) — normalized into one common schema so all four are
+    directly comparable, despite coming from differently-shaped source files.
+
+    Columns: training_emissions_mg, streaming_emissions_mg (whole-run;
+    NaN for a no_update/incremental CSV predating the whole-run tracker
+    fix), content_build_emissions_mg / content_seed_emissions_mg (NaN for
+    no_update/incremental, which have neither), update_total_emissions_mg,
+    n_updates, avg_emissions_per_update_mg, grand_total_mg (training +
+    streaming).
+
+    Outputs: prints table; saves to `out`/`latex` if given.
+    """
+    def from_hybrid(csv_path, strategy):
+        row = pd.read_csv(csv_path).iloc[0]
+        return {
+            "run":                        strategy,
+            "training_emissions_mg":      row.get("training_emissions_mg", 0.0),
+            "streaming_emissions_mg":     row.get(f"{strategy}_streaming_emissions_mg", float("nan")),
+            "content_build_emissions_mg": float("nan"),
+            "content_seed_emissions_mg":  float("nan"),
+            "update_total_emissions_mg":  row.get(f"{strategy}_total_emissions_mg", 0.0),
+            "n_updates":                  int(row.get(f"{strategy}_n_updates", 0)),
+            "avg_emissions_per_update_mg": row.get(f"{strategy}_avg_emissions_per_update_mg", 0.0),
+        }
+
+    def from_content(csv_path, label):
+        row = pd.read_csv(csv_path).iloc[0]
+        return {
+            "run":                        label,
+            "training_emissions_mg":      row.get("training_emissions_mg", 0.0),
+            "streaming_emissions_mg":     row.get("streaming_emissions_mg", 0.0),
+            "content_build_emissions_mg": row.get("content_build_emissions_mg", float("nan")),
+            "content_seed_emissions_mg":  row.get("total_seed_emissions_mg", float("nan")),
+            "update_total_emissions_mg":  row.get("total_update_emissions_mg", 0.0),
+            "n_updates":                  int(row.get("n_updates", 0)),
+            "avg_emissions_per_update_mg": row.get("avg_emissions_per_update_mg", 0.0),
+        }
+
+    print(f"no_update:           {no_update_csv}")
+    print(f"incremental:         {incremental_csv}")
+    print(f"content_coldstart:   {content_coldstart_csv}")
+    print(f"content_incremental: {content_incremental_csv}\n")
+
+    rows = [
+        from_hybrid(no_update_csv, "no_update"),
+        from_hybrid(incremental_csv, "incremental"),
+        from_content(content_coldstart_csv, "content_coldstart"),
+        from_content(content_incremental_csv, "content_incremental"),
+    ]
+    summary = pd.DataFrame(rows).set_index("run")
+    summary["grand_total_mg"] = summary["training_emissions_mg"] + summary["streaming_emissions_mg"]
+    _report(summary, out, latex)
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -506,6 +573,22 @@ def main():
     p7.add_argument("--out", type=Path, default=None)
     p7.add_argument("--latex", type=Path, default=None)
 
+    p8 = sub.add_parser("energy-summary",
+                        help="Compare energy/emissions across no_update, incremental, "
+                             "content_coldstart, and content_incremental")
+    p8.add_argument("--no-update-csv", type=Path, required=True,
+                    help="A run_incremental_lightgcn.py *_hybrid_emissions_summary CSV "
+                         "(no_update run)")
+    p8.add_argument("--incremental-csv", type=Path, required=True,
+                    help="A run_incremental_lightgcn.py *_hybrid_emissions_summary CSV "
+                         "(incremental run)")
+    p8.add_argument("--content-coldstart-csv", type=Path, required=True,
+                    help="A run_content_coldstart.py *_energy.csv sidecar")
+    p8.add_argument("--content-incremental-csv", type=Path, required=True,
+                    help="A run_content_incremental.py *_energy.csv sidecar")
+    p8.add_argument("--out", type=Path, default=None)
+    p8.add_argument("--latex", type=Path, default=None)
+
     args = parser.parse_args()
 
     if args.command == "no-update-vs-incremental":
@@ -530,6 +613,10 @@ def main():
     elif args.command == "content-init-vs-incremental":
         compare_content_init_vs_incremental(args.content_csv, args.incremental_csv,
                                             metric=args.metric, out=args.out, latex=args.latex)
+    elif args.command == "energy-summary":
+        compare_energy_summary(args.no_update_csv, args.incremental_csv,
+                               args.content_coldstart_csv, args.content_incremental_csv,
+                               out=args.out, latex=args.latex)
 
 
 if __name__ == "__main__":
