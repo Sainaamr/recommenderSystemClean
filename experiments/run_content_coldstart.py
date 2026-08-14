@@ -155,6 +155,10 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
 
     print(f"\n── Streaming {n_batches} batches (content-init, no retraining) ───────")
 
+    # DIAGNOSTIC: no per-batch/per-seed tracker at all here — the outer
+    # whole-run tracker in main() is the only one measuring this run, to
+    # test whether the many per-batch EmissionsTracker instantiations were
+    # inflating the streaming total.
     for i in range(n_batches):
         batch = df_rt.iloc[i * BATCH_SIZE:(i + 1) * BATCH_SIZE].copy()
 
@@ -184,13 +188,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
         content_seed_this_batch = {}
         promoted_iids_this_batch = []  # excluded-history items promoted to real iids
 
-        recovered_seed_tracker = EmissionsTracker(
-            project_name=f"content_seed_recovered_batch_{i}",
-            output_dir=str(RESULTS_DIR),
-            log_level="error",
-            save_to_file=False,
-        )
-        recovered_seed_tracker.start()
         for uid, u_tok in newly_arrived:
             hist_items = content_init.get_excluded_history(u_tok)
             if not hist_items:
@@ -210,7 +207,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             content_seed_this_batch[uid] = content_init.get_embedding(hist_items)
             accumulated_items[uid] = list(hist_items)
             content_seeded.add(uid)
-        kg_co2_recovered_seed = recovered_seed_tracker.stop() or 0.0
 
         max_u = max(batch_users, default=0)
         max_i = max(batch_items + promoted_iids_this_batch, default=0)
@@ -251,16 +247,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
                 if iid not in accumulated_items[uid]:
                     accumulated_items[uid].append(iid)
 
-        seed_tracker = EmissionsTracker(
-            project_name=f"content_seed_batch_{i}",
-            output_dir=str(RESULTS_DIR),
-            log_level="error",
-            save_to_file=False,
-        )
-        seed_tracker.start()
         _apply_content_seeds_once(lgcn, content_init, accumulated_items, content_seeded)
-        kg_co2_seed = seed_tracker.stop() or 0.0
-        content_seed_emissions_mg = (kg_co2_recovered_seed + kg_co2_seed) * 1e6
 
         records.append({
             "batch":                     i + 1,
@@ -283,7 +270,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             "n_new_users":               n_new_users,
             "pct_new_users":             pct_new_users,
             "n_users_trained":           n_users_trained,
-            "content_seed_emissions_mg": content_seed_emissions_mg,
         })
 
         if (i + 1) % 20 == 0:
@@ -374,7 +360,6 @@ def main():
         else:
             print("  (no emissions sidecar found for this CSV — energy unknown)")
             training_emissions_mg = streaming_emissions_mg = content_build_emissions_mg = 0.0
-        total_seed_emissions = df["content_seed_emissions_mg"].sum() if "content_seed_emissions_mg" in df.columns else 0.0
     else:
         print("\n── Loading LightGCN checkpoint ──────────────────────────────────────")
         ckpt, training_emissions_mg = train_historical(cfg)
@@ -400,14 +385,11 @@ def main():
         df.to_csv(out_csv, index=False)
         print(f"\nResults saved → {out_csv}")
 
-        total_seed_emissions = df["content_seed_emissions_mg"].sum()
-
         energy_path = Path(str(out_csv).replace(".csv", "_energy.csv"))
         pd.DataFrame([{
             "training_emissions_mg":      training_emissions_mg,
             "streaming_emissions_mg":     streaming_emissions_mg,
             "content_build_emissions_mg": content_build_emissions_mg,
-            "total_seed_emissions_mg":    total_seed_emissions,
         }]).to_csv(energy_path, index=False)
         print(f"Emissions saved → {energy_path}")
 
@@ -446,7 +428,6 @@ def main():
 
     print(f"  Historical training emissions:       {training_emissions_mg:.4f} mg CO2eq")
     print(f"  Content index build emissions:       {content_build_emissions_mg:.4f} mg CO2eq  (one-time)")
-    print(f"  Total content-seeding emissions:     {total_seed_emissions:.4f} mg CO2eq  (every batch)")
     print(f"  Content cold-start emissions:        {streaming_emissions_mg:.4f} mg CO2eq")
     print(f"  Total emissions:                     {training_emissions_mg + streaming_emissions_mg:.4f} mg CO2eq")
 

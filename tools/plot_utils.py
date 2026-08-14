@@ -10,7 +10,7 @@ from pathlib import Path
 COLORS = {
     "no_update":    "#e63946",
     "incremental":  "#2a9d8f",
-    "full_retrain": "#e7ab51",
+    "full_retrain": "#2a9d8f",
 }
 SMOOTH = 30   # rolling average window for recall lines
 DPI    = 150
@@ -66,8 +66,7 @@ METRIC_LABELS = {
 }
 
 
-def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
-                          metric: str = "recall_at_10", subtitle: str = None):
+def plot_metric_over_time(ax, df: pd.DataFrame, metric: str = "recall_at_10", subtitle: str = None):
     """
     Plots one metric over time for no_update/incremental/full_retrain, with
     update-trigger markers. Draws onto an existing ax — no file output itself
@@ -78,7 +77,7 @@ def plot_metric_over_time(ax, df: pd.DataFrame, update_every: int,
     label_map = {
         "no_update":    "No-Update",
         "incremental":  "Incremental Update",
-        "full_retrain": f"Full retrain (every {update_every} batches)",
+        "full_retrain": "Full Retrain",
     }
 
     for strategy, grp in df.groupby("strategy"):
@@ -218,7 +217,7 @@ def plot_emissions_stacked(strategy_csvs: dict, out_path: Path, title: str,
 
 
 def plot_streaming_results(df: pd.DataFrame, out_path: Path,
-                           title: str, update_every: int,
+                           title: str,
                            training_emissions_mg: float = None, subtitle: str = None,
                            metrics: list = None):
     """
@@ -234,7 +233,7 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
     available = [m for m in METRIC_LABELS if m in df.columns and (metrics is None or m in metrics)]
     for metric in available:
         fig, ax = plt.subplots(figsize=(12, 5))
-        plot_metric_over_time(ax, df, update_every, metric=metric, subtitle=subtitle)
+        plot_metric_over_time(ax, df, metric=metric, subtitle=subtitle)
         _center_suptitle_over_axes(fig, ax, title)
         path = Path(f"{base}_{metric}.png")
         plt.savefig(path, dpi=DPI)
@@ -716,6 +715,84 @@ def plot_all_strategies_comparison(df_no_update: pd.DataFrame, df_incremental: p
         _add_end_xtick(ax, max_x)
         ax.legend(loc="upper left", fontsize=9)
         chart_title = "Strategy Comparison"
+        if subtitle:
+            ax.set_title(subtitle)
+            _center_suptitle_over_axes(fig, ax, chart_title)
+        else:
+            ax.set_title(chart_title)
+            _center_suptitle_over_axes(fig, ax, title)
+        path = Path(f"{base}_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
+
+
+def plot_no_update_incremental_full_retrain(df_no_update: pd.DataFrame, df_incremental: pd.DataFrame,
+                                             df_full_retrain: pd.DataFrame, out_path: Path, title: str,
+                                             subtitle: str = None, smooth: int = 30):
+    """
+    Overall recall/precision/ndcg@10 for no_update, incremental, and
+    full_retrain on one set of axes per metric — built for the MovieLens
+    3-strategy comparison (run_incremental_lightgcn.py's "{metric}_at_10"
+    columns, same schema all three strategies share). Fixed colors of its
+    own (no_update=red, incremental=teal, full_retrain=dark blue),
+    independent of the shared COLORS dict, so this chart's color choices
+    don't leak into other charts that reuse COLORS.
+
+    Outputs (results/): ml1m_no_update_vs_incremental_vs_full_retrain_{metric}.png per metric.
+    """
+    base = Path(str(out_path).replace(".png", ""))
+    max_x = int(df_no_update["interactions"].max())
+
+    def smoothed(df, col):
+        return df[col].rolling(smooth, min_periods=1, center=True).mean()
+
+    # incremental and full_retrain share the same update_every schedule in
+    # this dataset (verified) — one shared marker set is enough.
+    update_x = df_incremental.loc[df_incremental["updated"] == True, "interactions"]
+
+    series_colors = {
+        "no_update":    "#e63946",  # red
+        "incremental":  "#2a9d8f",  # teal
+        "full_retrain": "#023e8a",  # dark blue
+    }
+    series_labels = {
+        "no_update":    "No-Update",
+        "incremental":  "Incremental Update",
+        "full_retrain": "Full Retrain",
+    }
+
+    for metric, ylabel, _ in _CONTENT_COLDSTART_METRICS:
+        col = f"{metric}_at_10"
+        fig, ax = plt.subplots(figsize=(12, 5))
+        series = [
+            (df_no_update,    "no_update"),
+            (df_incremental,  "incremental"),
+            (df_full_retrain, "full_retrain"),
+        ]
+        for df_s, strategy in series:
+            color = series_colors[strategy]
+            ax.plot(df_s["interactions"], df_s[col], color=color, alpha=0.15, linewidth=0.8)
+            ax.plot(df_s["interactions"], smoothed(df_s, col), color=color, linewidth=2,
+                    label=series_labels[strategy])
+
+        for j, xv in enumerate(update_x):
+            ax.axvline(xv, color="black", alpha=0.55, linewidth=1.2, linestyle="--",
+                      label="Update triggered" if j == 0 else None)
+
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Interactions seen")
+        ax.set_xlim(left=0, right=max_x)
+
+        # 1st-99th percentile zoom, not strict min/max — see plot_metric_over_time.
+        all_vals = pd.concat([df_s[col] for df_s, _ in series])
+        y_min, y_max = all_vals.quantile(0.01), all_vals.quantile(0.99)
+        pad = (y_max - y_min) * 0.08
+        ax.set_ylim(max(0, y_min - pad), y_max + pad)
+
+        _add_end_xtick(ax, max_x)
+        ax.legend(loc="upper left", fontsize=9)
+        chart_title = "No-Update vs Incremental vs Full Retrain"
         if subtitle:
             ax.set_title(subtitle)
             _center_suptitle_over_axes(fig, ax, chart_title)
