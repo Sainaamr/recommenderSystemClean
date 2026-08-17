@@ -42,7 +42,7 @@ from src.models.incremental_lightgcn import IncrementalLightGCN
 from src.models.content_user_init import ContentUserInitializer
 from experiments.run_incremental_lightgcn import (
     DATASET_CONFIGS, RESULTS_DIR, BATCH_SIZE, UPDATE_EVERY, UPDATE_EPOCHS,
-    load_id_mappings, build_user_history, train_historical,
+    load_id_mappings, build_user_history, train_historical, task_mg,
 )
 from experiments.run_content_coldstart import ITEM_META_PATH, merge_new_user_baseline
 from tools.plot_utils import plot_content_incremental_groups, _CONTENT_COLDSTART_METRICS
@@ -109,7 +109,7 @@ def _apply_content_seeds_once(lgcn: IncrementalLightGCN, content_init: ContentUs
 
 # Streaming loop
 
-def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
+def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, float, dict]:
     """
     1. Load the trained model and mappings
     2. Build history: used later to mask already-seen items out of every ranking
@@ -131,14 +131,41 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
     13. Apply the one-time content seed for anyone now eligible
     14. incremental update
     """
+
+    tracker = EmissionsTracker(
+        project_name="content_incremental",
+        output_dir=str(RESULTS_DIR),
+        log_level="error",
+        save_to_file=False,
+    )
+    tracker.start()
+
+    tracker.start_task("load_id_mappings")
     user2id, item2id, config, dataset = load_id_mappings(cfg)
+    id_mapping_emissions_mg = task_mg(tracker.stop_task())
+
+    tracker.start_task("load_checkpoint")
     lgcn = IncrementalLightGCN.from_checkpoint(ckpt, config, dataset)
+    checkpoint_load_emissions_mg = task_mg(tracker.stop_task())
+
+    tracker.start_task("build_user_history")
     history = build_user_history(user2id, item2id, cfg)
+    build_user_history_emissions_mg = task_mg(tracker.stop_task())
     n_users_trained = lgcn.n_users
 
+    tracker.start_task("initial_embedding_snapshot")
     lgcn.eval()
     with torch.no_grad():
         user_emb, item_emb = lgcn.forward()
+    embedding_snapshot_emissions_mg = task_mg(tracker.stop_task())
+
+    section_emissions_mg = {
+        "id_mapping_emissions_mg":         id_mapping_emissions_mg,
+        "checkpoint_load_emissions_mg":    checkpoint_load_emissions_mg,
+        "build_user_history_emissions_mg": build_user_history_emissions_mg,
+        "embedding_snapshot_emissions_mg": embedding_snapshot_emissions_mg,
+    }
+    streaming_emissions_mg = sum(section_emissions_mg.values())
 
     print("\n── Building content-aware user index ────────────────────────────────")
     geo_precision = 4
@@ -150,13 +177,7 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
         # No build happened — nothing to measure.
         content_build_emissions_mg = 0.0
     else:
-        build_tracker = EmissionsTracker(
-            project_name="content_index_build",
-            output_dir=str(RESULTS_DIR),
-            log_level="error",
-            save_to_file=False,
-        )
-        build_tracker.start()
+        tracker.start_task("content_build")
         content_init = ContentUserInitializer(alpha=0.7, top_k=20, geo_precision=geo_precision)
         content_init.build(
             item_meta_path        = ITEM_META_PATH, # path to yelp.item
@@ -166,8 +187,8 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             user_emb              = user_emb.cpu().numpy(), # frozen embedding from the checkpoint
         )
         content_init.save(str(cache_path))
-        kg_co2_build = build_tracker.stop() or 0.0
-        content_build_emissions_mg = kg_co2_build * 1e6
+        content_build_emissions_mg = task_mg(tracker.stop_task())
+        streaming_emissions_mg += content_build_emissions_mg
         print(f"  Content index build emissions: {content_build_emissions_mg:.4f} mg CO2eq")
 
     id_cast = cfg["id_cast"]
@@ -193,6 +214,9 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
           f"(content-init + incremental update every {update_every} batches) ──")
 
     for i in range(n_batches):
+
+        tracker.start_task(f"batch_{i}_id_resolution")
+
         batch = df_rt.iloc[i * BATCH_SIZE:(i + 1) * BATCH_SIZE].copy()
 
         newly_arrived = []  # (uid, raw_token)
@@ -218,18 +242,14 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
         batch_users = batch["uid"].tolist()
         batch_items = batch["iid"].tolist()
 
+        id_resolution_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_recovered_history_seed")
+
         content_seed_this_batch = {}
         promoted_iids_this_batch = [] # collect ids that get generated for recovered item
                                       # from excluded history
 
-
-        recovered_seed_tracker = EmissionsTracker(
-            project_name=f"content_seed_recovered_batch_{i}",
-            output_dir=str(RESULTS_DIR),
-            log_level="error",
-            save_to_file=False,
-        )
-        recovered_seed_tracker.start()
         for uid, u_tok in newly_arrived:
             hist_items = content_init.get_excluded_history(u_tok) # user recovered history
             if not hist_items:
@@ -254,8 +274,10 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             content_seed_this_batch[uid] = content_init.get_embedding(hist_items) # Content seed computed from the recovered history itself
             accumulated_items[uid] = list(hist_items)
             content_seeded.add(uid) # mark as seeded so it's not recomputed
-        kg_co2_recovered_seed = recovered_seed_tracker.stop() or 0.0
 
+        recovered_history_seed_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_expand_embeddings")
 
         max_u = max(batch_users, default=0)
         max_i = max(batch_items + promoted_iids_this_batch, default=0)
@@ -269,14 +291,27 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             with torch.no_grad():
                 user_emb, item_emb = lgcn.forward()
 
+        expand_embeddings_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_gt_split")
+
         # Split ground truth
         existing_gt, new_user_gt = {}, {}
         for uid, iid in zip(batch_users, batch_items):
             (new_user_gt if uid >= n_users_trained else existing_gt).setdefault(uid, set()).add(iid)
 
+        gt_split_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_scoring")
+
         # SCORE
         m_existing, m_new_content, m_overall_content = score_batch(
             user_emb, item_emb, existing_gt, new_user_gt, history)
+
+        scoring_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_history_update")
+
         # filtering out the preciously new users from previous batches form this batch current user
         new_user_set = set(new_user_gt.keys())
         n_new_users = len(new_user_set - seen_as_new)
@@ -293,19 +328,24 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             buffer_users.append(uid)
             buffer_items.append(iid)
 
+        history_update_emissions_mg = task_mg(tracker.stop_task())
 
-        seed_tracker = EmissionsTracker(
-            project_name=f"content_seed_batch_{i}",
-            output_dir=str(RESULTS_DIR),
-            log_level="error",
-            save_to_file=False,
-        )
-        seed_tracker.start()
+        tracker.start_task(f"batch_{i}_apply_content_seeds")
+
         _apply_content_seeds_once(lgcn, content_init, accumulated_items, content_seeded, gradient_touched)
-        kg_co2_seed = seed_tracker.stop() or 0.0
-        # Sum both content-seeding paths (recovered-history-at-creation +
-        # first-interaction-fallback) into one figure for this batch.
-        content_seed_emissions_mg = (kg_co2_recovered_seed + kg_co2_seed) * 1e6
+
+        apply_content_seeds_emissions_mg = task_mg(tracker.stop_task())
+
+        batch_emissions_mg = (
+            id_resolution_emissions_mg
+            + recovered_history_seed_emissions_mg
+            + expand_embeddings_emissions_mg
+            + gt_split_emissions_mg
+            + scoring_emissions_mg
+            + history_update_emissions_mg
+            + apply_content_seeds_emissions_mg
+        )
+        streaming_emissions_mg += batch_emissions_mg
 
         # ---- Periodic incremental update ----
         update_emissions_mg = 0.0
@@ -314,19 +354,13 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             new_users_arr = np.array(buffer_users)
             new_items_arr = np.array(buffer_items)
 
-            tracker = EmissionsTracker(
-                project_name=f"content_incremental_update_batch_{i}",
-                output_dir=str(RESULTS_DIR),
-                log_level="error",
-                save_to_file=False,
-            )
-            tracker.start()
+            # Back-to-back with the batch task just stopped above — no gap.
+            # Covers the gradient update AND the post-update forward-pass
+            # refresh below, so no time between this and the next batch's
+            # task goes unmeasured.
+            tracker.start_task(f"batch_{i}_update")
             lgcn.add_interactions(new_users_arr, new_items_arr)
             lgcn.incremental_update(new_users_arr, new_items_arr, n_epochs=UPDATE_EPOCHS)
-            # tracker.stop() returns CO2 emissions in kg, not energy; *1e6
-            # converts kg -> mg, matching the mg CO2eq convention used elsewhere.
-            kg_co2 = tracker.stop() or 0.0
-            update_emissions_mg = kg_co2 * 1e6
             updated = True
 
             gradient_touched.update(buffer_users)
@@ -335,6 +369,9 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             lgcn.eval()
             with torch.no_grad():
                 user_emb, item_emb = lgcn.forward()
+
+            update_emissions_mg = task_mg(tracker.stop_task())
+            streaming_emissions_mg += update_emissions_mg
 
         records.append({
             "batch":                     i + 1,
@@ -357,7 +394,14 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
             "n_new_users":               n_new_users,
             "pct_new_users":             pct_new_users,
             "n_users_trained":           n_users_trained,
-            "content_seed_emissions_mg": content_seed_emissions_mg,
+            "id_resolution_emissions_mg":          id_resolution_emissions_mg,
+            "recovered_history_seed_emissions_mg": recovered_history_seed_emissions_mg,
+            "expand_embeddings_emissions_mg":      expand_embeddings_emissions_mg,
+            "gt_split_emissions_mg":               gt_split_emissions_mg,
+            "scoring_emissions_mg":                scoring_emissions_mg,
+            "history_update_emissions_mg":         history_update_emissions_mg,
+            "apply_content_seeds_emissions_mg":    apply_content_seeds_emissions_mg,
+            "batch_emissions_mg":        batch_emissions_mg,
             "update_emissions_mg":       update_emissions_mg,
             "updated":                   updated,
         })
@@ -367,7 +411,8 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float]:
                   f"new_content={m_new_content['recall@10']:.4f}  "
                   f"n_new={n_new_users}  updated={updated}")
 
-    return pd.DataFrame(records), content_build_emissions_mg
+    tracker.stop()
+    return pd.DataFrame(records), content_build_emissions_mg, streaming_emissions_mg, section_emissions_mg
 
 
 # Main
@@ -413,16 +458,7 @@ def main():
 
         print("\n── Running content-init + incremental update experiment ─────────────")
 
-        tracker = EmissionsTracker(
-            project_name=f"content_incremental_{args.dataset}",
-            output_dir=str(results_dir),
-            log_level="error",
-            save_to_file=False,
-        )
-        tracker.start()
-        df, content_build_emissions_mg = run_content_incremental(cfg, ckpt)
-        kg_co2 = tracker.stop() or 0.0
-        streaming_emissions_mg = kg_co2 * 1e6
+        df, content_build_emissions_mg, streaming_emissions_mg, section_emissions_mg = run_content_incremental(cfg, ckpt)
         print(f"  Content-incremental streaming emissions: {streaming_emissions_mg:.4f} mg CO2eq")
 
         df.to_csv(out_csv, index=False)
@@ -430,19 +466,20 @@ def main():
 
         # Aggregated from the already-measured per-batch columns — same
         # values the console summary below prints, now persisted too.
-        n_updates              = int(df["updated"].sum())
-        total_update_emissions = df["update_emissions_mg"].sum()
-        total_seed_emissions   = df["content_seed_emissions_mg"].sum()
+        n_updates               = int(df["updated"].sum())
+        total_update_emissions  = df["update_emissions_mg"].sum()
+        total_batch_emissions   = df["batch_emissions_mg"].sum()
 
         energy_path = Path(str(out_csv).replace(".csv", "_energy.csv"))
         pd.DataFrame([{
             "training_emissions_mg":       training_emissions_mg,
-            "streaming_emissions_mg":      streaming_emissions_mg,
+            **section_emissions_mg,
             "content_build_emissions_mg":  content_build_emissions_mg,
+            "total_batch_emissions_mg":    total_batch_emissions,
             "total_update_emissions_mg":   total_update_emissions,
             "n_updates":                   n_updates,
             "avg_emissions_per_update_mg": total_update_emissions / max(n_updates, 1),
-            "total_seed_emissions_mg":     total_seed_emissions,
+            "streaming_emissions_mg":      streaming_emissions_mg,
         }]).to_csv(energy_path, index=False)
         print(f"Emissions saved → {energy_path}")
 
@@ -478,11 +515,11 @@ def main():
 
     n_updates = int(plot_df["updated"].sum()) if "updated" in plot_df.columns else 0
     total_update_emissions = plot_df["update_emissions_mg"].sum() if "update_emissions_mg" in plot_df.columns else 0.0
-    total_seed_emissions = plot_df["content_seed_emissions_mg"].sum() if "content_seed_emissions_mg" in plot_df.columns else 0.0
+    total_batch_emissions = plot_df["batch_emissions_mg"].sum() if "batch_emissions_mg" in plot_df.columns else 0.0
     print(f"  Historical training emissions:       {training_emissions_mg:.4f} mg CO2eq")
     print(f"  Content index build emissions:       {content_build_emissions_mg:.4f} mg CO2eq  (one-time)")
     print(f"  Streaming (whole run) emissions:     {streaming_emissions_mg:.4f} mg CO2eq")
-    print(f"  Total content-seeding emissions:     {total_seed_emissions:.4f} mg CO2eq  (every batch)")
+    print(f"  Total batch emissions (scoring+seed):{total_batch_emissions:.4f} mg CO2eq  (every batch)")
     print(f"  Total incremental-update emissions:  {total_update_emissions:.4f} mg CO2eq  ({n_updates} updates)")
     print(f"  Total emissions:                     {training_emissions_mg + streaming_emissions_mg:.4f} mg CO2eq")
 
