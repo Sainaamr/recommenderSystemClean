@@ -76,6 +76,11 @@ DATASET_CONFIGS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def task_mg(task_result) -> float:
+    """codecarbon stop_task() result (kg CO2, or None) -> mg CO2eq."""
+    return (task_result.emissions if task_result else 0.0) * 1e6
+
+
 # Step 1: Train on historical data
 """
 cfg: dataset configuration
@@ -203,7 +208,8 @@ def build_user_history(user2id: dict, item2id: dict, cfg: dict) -> dict:
 - cfg — the settings dictionary for whichever dataset is running (paths, id_cast, batch_size, etc.) — explained in detail a few messages back.
 """
 def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
-                  user_history: dict, strategy: str, cfg: dict) -> pd.DataFrame:
+                  user_history: dict, strategy: str, cfg: dict,
+                  tracker: EmissionsTracker) -> tuple[pd.DataFrame, float]:
     """
     Stream realtime data in batches of BATCH_SIZE.
     strategy: 'no_update', 'incremental', or 'full_retrain'
@@ -226,6 +232,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
 
     records = [] # to keep track
+    batch_loop_emissions_mg = 0.0
 
     # Deep copy history so strategies don't interfere with each other
     history = {uid: set(items) for uid, items in user_history.items()}
@@ -290,6 +297,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         buffer_items = []
 
     for i in range(n_batches):
+        tracker.start_task(f"batch_{i}")
         batch = df.iloc[i * batch_size: (i + 1) * batch_size].copy()
 
         if strategy == "full_retrain":
@@ -325,82 +333,73 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                  "recall@20": 0.0, "precision@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
         recall = m["recall@10"]
 
-        update_emissions_mg = 0.0
-        updated = False
+        needs_update = False
 
         if strategy == "incremental":
             # Accumulate interactions into buffer
             buffer_users.extend(batch_users)
             buffer_items.extend(batch_items)
-
-            if (i + 1) % update_every == 0:
+            needs_update = (i + 1) % update_every == 0
+            if needs_update:
                 # Use all accumulated interactions since last update (not just current batch)
                 # This gives a stronger gradient signal: 20 batches × 1000 = 20,000 interactions
                 new_users = np.array(buffer_users)
                 new_items = np.array(buffer_items)
 
-                tracker = EmissionsTracker(
-                    project_name=f"incremental_update_batch_{i}",
-                    output_dir=str(RESULTS_DIR),
-                    log_level="error",
-                    save_to_file=False,
-                )
-                tracker.start()
-                model.add_interactions(new_users, new_items)
-                model.incremental_update(new_users, new_items, n_epochs=UPDATE_EPOCHS)
-                # tracker.stop() returns CO2 emissions in kg, not energy;
-                # *1e6 converts kg to mg (see train_historical for details).
-                kg_co2 = tracker.stop() or 0.0
-                update_emissions_mg = kg_co2 * 1e6
-                updated = True
-
-                # Clear buffer after update
-                buffer_users = []
-                buffer_items = []
-
         elif strategy == "full_retrain":
             consumed_raw_upto = max(consumed_raw_upto, int(batch["orig_idx"].max()))
-
-            if (i + 1) % update_every == 0:
-                #
-                consumed_realtime = realtime_df.iloc[: consumed_raw_upto + 1]
-                combined = pd.concat([historical_raw, consumed_realtime], ignore_index=True)
-                combined.to_csv(combined_path, sep="\t", index=False)
-
-                tracker = EmissionsTracker(
-                    project_name=f"full_retrain_batch_{i}",
-                    output_dir=str(RESULTS_DIR),
-                    log_level="error",
-                    save_to_file=False,
-                )
-                tracker.start()
-                run_recbole(model="LightGCN", dataset=combined_name, config_file_list=cfg["config_files"])
-                # tracker.stop() returns CO2 emissions in kg, not energy;
-                # *1e6 converts kg to mg (see train_historical for details).
-                kg_co2 = tracker.stop() or 0.0
-                update_emissions_mg = kg_co2 * 1e6
-
-                checkpoints = sorted(glob.glob("saved/LightGCN-*.pth"))
-                assert checkpoints, "No LightGCN checkpoint found after full retrain"
-                raw_ckpt_path = checkpoints[-1]
-
-
-                retrain_dir = Path("saved/full_retrain") / cfg["dataset"]
-                retrain_dir.mkdir(parents=True, exist_ok=True)
-                ckpt_path = retrain_dir / f"batch_{i + 1:04d}.pth"
-                Path(raw_ckpt_path).rename(ckpt_path)
-                ckpt_path = str(ckpt_path)
-
-                user2id, item2id, config, dataset = load_id_mappings(combined_cfg)
-                model = IncrementalLightGCN.from_checkpoint(ckpt_path, config, dataset)
-                history = build_user_history(user2id, item2id, combined_cfg)
-                updated = True
+            needs_update = (i + 1) % update_every == 0
 
         # Add batch to running history
         for uid, iid in zip(batch_users, batch_items):
             if uid not in history:
                 history[uid] = set()
             history[uid].add(iid)
+
+        batch_emissions_mg = task_mg(tracker.stop_task())
+        batch_loop_emissions_mg += batch_emissions_mg
+
+        update_emissions_mg = 0.0
+        updated = False
+
+        if strategy == "incremental" and needs_update:
+
+            tracker.start_task(f"batch_{i}_update")
+            model.add_interactions(new_users, new_items)
+            model.incremental_update(new_users, new_items, n_epochs=UPDATE_EPOCHS)
+            update_emissions_mg = task_mg(tracker.stop_task())
+            batch_loop_emissions_mg += update_emissions_mg
+            updated = True
+
+            # Clear buffer after update
+            buffer_users = []
+            buffer_items = []
+
+        elif strategy == "full_retrain" and needs_update:
+            tracker.start_task(f"batch_{i}_update")
+            consumed_realtime = realtime_df.iloc[: consumed_raw_upto + 1]
+            combined = pd.concat([historical_raw, consumed_realtime], ignore_index=True)
+            combined.to_csv(combined_path, sep="\t", index=False)
+
+            run_recbole(model="LightGCN", dataset=combined_name, config_file_list=cfg["config_files"])
+
+            checkpoints = sorted(glob.glob("saved/LightGCN-*.pth"))
+            assert checkpoints, "No LightGCN checkpoint found after full retrain"
+            raw_ckpt_path = checkpoints[-1]
+
+            retrain_dir = Path("saved/full_retrain") / cfg["dataset"]
+            retrain_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = retrain_dir / f"batch_{i + 1:04d}.pth"
+            Path(raw_ckpt_path).rename(ckpt_path)
+            ckpt_path = str(ckpt_path)
+
+            user2id, item2id, config, dataset = load_id_mappings(combined_cfg)
+            model = IncrementalLightGCN.from_checkpoint(ckpt_path, config, dataset)
+            history = build_user_history(user2id, item2id, combined_cfg)
+
+            update_emissions_mg = task_mg(tracker.stop_task())
+            batch_loop_emissions_mg += update_emissions_mg
+            updated = True
 
         records.append({
             "batch":             i + 1,
@@ -415,6 +414,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             "ndcg_at_20":        m["ndcg@20"],
             "hr_at_20":          m["hr@20"],
             "mrr":               m["mrr"],
+            "batch_emissions_mg":   batch_emissions_mg,
             "update_emissions_mg": update_emissions_mg,
             "updated":           updated,
         })
@@ -423,7 +423,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             print(f"  Batch {i+1:>3}/{n_batches}  Recall@10={recall:.4f}"
                   + (f"  ← updated ({update_emissions_mg:.4f} mg CO2eq)" if updated else ""))
 
-    return pd.DataFrame(records)
+    return pd.DataFrame(records), batch_loop_emissions_mg
 
 
 # Main
@@ -468,30 +468,50 @@ def main():
     dfs = {}
     csv_paths = {}
     streaming_emissions_mg = {}
+    section_emissions_mg = {}   # strategy -> {section_name: mg}, saved separately below
     for strategy in STRATEGIES:
         if not run_flags[strategy]:
             continue
         print(f"\nLoading model for {strategy} strategy...")
-        user2id, item2id, config, dataset = load_id_mappings(cfg)
-        model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
-        user_history = build_user_history(user2id, item2id, cfg)
 
-        # Whole-run tracker (scoring + updates together), matching the
-        # convention in run_content_coldstart.py / run_content_incremental.py
-        # — makes their streaming_emissions_mg directly comparable to this
-        # one, unlike {strategy}_total_emissions_mg below, which only sums
-        # the update steps and excludes per-batch scoring cost.
+
         tracker = EmissionsTracker(
-            project_name=f"streaming_{strategy}_{args.dataset}",
-            output_dir=str(results_dir),
+            project_name=f"streaming_{strategy}_{cfg['dataset']}",
+            output_dir=str(RESULTS_DIR),
             log_level="error",
             save_to_file=False,
         )
         tracker.start()
-        df = run_streaming(model, user2id, item2id, user_history,
-                           strategy=strategy, cfg=cfg)
-        kg_co2 = tracker.stop() or 0.0
-        streaming_emissions_mg[strategy] = kg_co2 * 1e6
+
+        tracker.start_task("load_id_mappings")
+        user2id, item2id, config, dataset = load_id_mappings(cfg)
+        id_mapping_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task("load_checkpoint")
+        model = IncrementalLightGCN.from_checkpoint(checkpoint, config, dataset)
+        checkpoint_load_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task("build_user_history")
+        user_history = build_user_history(user2id, item2id, cfg)
+        build_user_history_emissions_mg = task_mg(tracker.stop_task())
+
+        df, batch_loop_emissions_mg = run_streaming(model, user2id, item2id, user_history,
+                           strategy=strategy, cfg=cfg, tracker=tracker)
+        tracker.stop()
+
+        sections = {
+            "id_mapping_emissions_mg":         id_mapping_emissions_mg,
+            "checkpoint_load_emissions_mg":    checkpoint_load_emissions_mg,
+            "build_user_history_emissions_mg": build_user_history_emissions_mg,
+            "batch_scoring_emissions_mg":      df["batch_emissions_mg"].sum(),
+            "update_total_emissions_mg":       df["update_emissions_mg"].sum(),
+        }
+        section_emissions_mg[strategy] = sections
+        # Whole-run emissions = sum of every separately-measured section —
+        # matches the convention in run_content_coldstart.py /
+        # run_content_incremental.py, so streaming_emissions_mg is directly
+        # comparable across all three scripts.
+        streaming_emissions_mg[strategy] = sum(sections.values())
         dfs[strategy] = df
 
         # Step 3: Save each strategy's results to its own CSV immediately
@@ -502,12 +522,13 @@ def main():
 
     energy_row = {"training_emissions_mg": training_emissions_mg}
     for strategy, df in dfs.items():
+        for section_name, section_mg in section_emissions_mg[strategy].items():
+            energy_row[f"{strategy}_{section_name}"] = section_mg
         energy_row[f"{strategy}_streaming_emissions_mg"] = streaming_emissions_mg[strategy]
         if strategy == "no_update":
             continue
-        total_emissions = df["update_emissions_mg"].sum()
+        total_emissions = section_emissions_mg[strategy]["update_total_emissions_mg"]
         n_updates = int(df["updated"].sum())
-        energy_row[f"{strategy}_total_emissions_mg"] = total_emissions
         energy_row[f"{strategy}_n_updates"] = n_updates
         energy_row[f"{strategy}_avg_emissions_per_update_mg"] = total_emissions / max(n_updates, 1)
 
