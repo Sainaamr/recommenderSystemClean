@@ -297,7 +297,13 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         buffer_items = []
 
     for i in range(n_batches):
-        tracker.start_task(f"batch_{i}")
+        # Batch body split into named, back-to-back sub-tasks (no gaps
+        # between stop_task() and the next start_task()), so each phase's
+        # own cost is saved separately in the CSV, and batch_emissions_mg
+        # (their sum) is still the accurate whole-batch total — same
+        # pattern as run_content_coldstart.py / run_content_incremental.py.
+        tracker.start_task(f"batch_{i}_id_resolution")
+
         batch = df.iloc[i * batch_size: (i + 1) * batch_size].copy()
 
         if strategy == "full_retrain":
@@ -315,6 +321,11 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             batch_users = batch["uid"].tolist()
             batch_items = batch["iid"].tolist()
 
+        id_resolution_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_expand_embeddings")
+
+        if strategy != "full_retrain":
             # expansion — only grow the table if THIS batch actually
             # introduced a uid/iid beyond the model's current size
             max_u = max(batch_users, default=0)
@@ -325,6 +336,10 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                     max(max_i + 1, model.n_items),
                 )
 
+        expand_embeddings_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_scoring")
+
         # Measure metrics before update (reflects current model state, no data leakage)
         if batch_users:
             m = batch_metrics_lgcn(model, batch_users, batch_items, history)
@@ -332,6 +347,10 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             m = {"recall@10": 0.0, "precision@10": 0.0, "ndcg@10": 0.0, "hr@10": 0.0,
                  "recall@20": 0.0, "precision@20": 0.0, "ndcg@20": 0.0, "hr@20": 0.0, "mrr": 0.0}
         recall = m["recall@10"]
+
+        scoring_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_update_prep")
 
         needs_update = False
 
@@ -350,13 +369,25 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             consumed_raw_upto = max(consumed_raw_upto, int(batch["orig_idx"].max()))
             needs_update = (i + 1) % update_every == 0
 
+        update_prep_emissions_mg = task_mg(tracker.stop_task())
+
+        tracker.start_task(f"batch_{i}_history_update")
+
         # Add batch to running history
         for uid, iid in zip(batch_users, batch_items):
             if uid not in history:
                 history[uid] = set()
             history[uid].add(iid)
 
-        batch_emissions_mg = task_mg(tracker.stop_task())
+        history_update_emissions_mg = task_mg(tracker.stop_task())
+
+        batch_emissions_mg = (
+            id_resolution_emissions_mg
+            + expand_embeddings_emissions_mg
+            + scoring_emissions_mg
+            + update_prep_emissions_mg
+            + history_update_emissions_mg
+        )
         batch_loop_emissions_mg += batch_emissions_mg
 
         update_emissions_mg = 0.0
@@ -414,6 +445,11 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             "ndcg_at_20":        m["ndcg@20"],
             "hr_at_20":          m["hr@20"],
             "mrr":               m["mrr"],
+            "id_resolution_emissions_mg":     id_resolution_emissions_mg,
+            "expand_embeddings_emissions_mg": expand_embeddings_emissions_mg,
+            "scoring_emissions_mg":           scoring_emissions_mg,
+            "update_prep_emissions_mg":       update_prep_emissions_mg,
+            "history_update_emissions_mg":    history_update_emissions_mg,
             "batch_emissions_mg":   batch_emissions_mg,
             "update_emissions_mg": update_emissions_mg,
             "updated":           updated,
@@ -503,8 +539,8 @@ def main():
             "id_mapping_emissions_mg":         id_mapping_emissions_mg,
             "checkpoint_load_emissions_mg":    checkpoint_load_emissions_mg,
             "build_user_history_emissions_mg": build_user_history_emissions_mg,
-            "batch_scoring_emissions_mg":      df["batch_emissions_mg"].sum(),
-            "update_total_emissions_mg":       df["update_emissions_mg"].sum(),
+            "total_batch_emissions_mg":        df["batch_emissions_mg"].sum(),
+            "total_update_emissions_mg":       df["update_emissions_mg"].sum(),
         }
         section_emissions_mg[strategy] = sections
         # Whole-run emissions = sum of every separately-measured section —
@@ -527,7 +563,7 @@ def main():
         energy_row[f"{strategy}_streaming_emissions_mg"] = streaming_emissions_mg[strategy]
         if strategy == "no_update":
             continue
-        total_emissions = section_emissions_mg[strategy]["update_total_emissions_mg"]
+        total_emissions = section_emissions_mg[strategy]["total_update_emissions_mg"]
         n_updates = int(df["updated"].sum())
         energy_row[f"{strategy}_n_updates"] = n_updates
         energy_row[f"{strategy}_avg_emissions_per_update_mg"] = total_emissions / max(n_updates, 1)
