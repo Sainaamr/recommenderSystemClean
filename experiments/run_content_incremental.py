@@ -428,11 +428,16 @@ def main():
                              "dataset/checkpoint — merged in on 'batch' to provide the "
                              "mean-init baseline for comparison, without recomputing it")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
+    parser.add_argument("--update-every", type=int, default=None,
+                        help="Run incremental_update every N batches "
+                             f"(default: {UPDATE_EVERY})")
     args = parser.parse_args()
 
     results_dir = args.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
     cfg = DATASET_CONFIGS[args.dataset].copy()
+    if args.update_every is not None:
+        cfg["update_every"] = args.update_every
 
     ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_csv = results_dir / f"yelp_content_incremental_{ts}.csv"
