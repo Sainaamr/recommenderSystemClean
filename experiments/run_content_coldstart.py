@@ -468,7 +468,7 @@ def main():
                                   "Content-Aware Cold Start — yelp (no retraining)",
                                   subtitle="Yelp Dataset")
 
-    print(f"\n── Summary ──────────────────────────────────────────────────────────")
+    print("\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0
     any_mean_baseline = False
     for metric, label, has_baseline_col in _CONTENT_COLDSTART_METRICS:

@@ -499,7 +499,7 @@ def main():
         plot_content_incremental_groups(plot_df, out_png, "Content Incremental",
                                         subtitle="Yelp Dataset")
 
-    print(f"\n── Summary ──────────────────────────────────────────────────────────")
+    print("\n── Summary ──────────────────────────────────────────────────────────")
     new_mask = plot_df["n_new_users"] > 0
     any_mean_baseline = False
     for metric, label, has_baseline_col in _CONTENT_COLDSTART_METRICS:

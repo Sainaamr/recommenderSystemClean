@@ -3,6 +3,9 @@ Shared plotting utilities for experiment scripts.
 """
 
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -18,12 +21,29 @@ DPI    = 150
 
 # Keyed by cost source (not strategy) — one bar can stack multiple sources.
 # Unlisted sources cycle through _EMISSIONS_FALLBACK_CYCLE.
+# Colorblind-safe: Okabe-Ito for the base set, Paul Tol's "muted" scheme for
+# the extra hues plot_energy_summary_stacked's 14 sections need; setup
+# phases use grey tints instead of scarce distinct hues (negligible + not
+# core content).
 EMISSIONS_COMPONENT_COLORS = {
     "training":      "#2a78d6",  # blue
     "update":        "#eb6834",  # orange
     "content_seed":  "#e7ab51",
-    "content_build": "#6a4c93",
     "streaming":     "#f4a261",
+    "id_mapping":              "#E8E8E8",
+    "checkpoint_load":         "#C4C4C4",
+    "build_user_history":      "#A0A0A0",
+    "embedding_snapshot":      "#7C7C7C",
+    "content_build":           "#332288",  # Tol indigo
+    "id_resolution":           "#DDCC77",  # Tol sand
+    "recovered_history_seed":  "#CC6677",  # Tol rose
+    "expand_embeddings":       "#117733",  # Tol green
+    "gt_split":                "#88CCEE",  # Tol cyan
+    "scoring":                 "#44AA99",  # Tol teal
+    "update_prep":             "#999933",  # Tol olive
+    "history_update":          "#882255",  # Tol wine
+    "apply_content_seeds":     "#AA4499",  # Tol purple
+    "update_total":            "#D55E00",  # Okabe-Ito vermilion
 }
 _EMISSIONS_FALLBACK_CYCLE = ["#e63946", "#8ab17d", "#264653", "#f28482"]
 
@@ -163,7 +183,8 @@ def _draw_emissions_bars(ax, labels: list, strategy_components: dict, component_
     ax.set_xticklabels(labels)
     ax.set_xlim(-0.5 - (1 - bar_width), len(labels) - 0.5 + (1 - bar_width))
     ax.set_ylabel("Emissions (mg CO2eq, log scale)" if log_y else "Emissions (mg CO2eq)")
-    ax.legend(loc="upper left")
+    # Legend outside the axes — with many components it'd cover bars otherwise.
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.)
     if not log_y:
         ax.yaxis.set_major_formatter(lambda val, _: f"{val:,.0f}")
 
@@ -200,7 +221,7 @@ def plot_emissions_stacked(strategy_csvs: dict, out_path: Path, title: str,
     _draw_emissions_bars(ax, labels, strategy_components, component_order,
                          training_emissions_mg=training_emissions_mg)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=DPI)
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")  # fits the outside legend
     print(f"Plot saved → {out_path}")
     plt.close()
 
@@ -211,9 +232,60 @@ def plot_emissions_stacked(strategy_csvs: dict, out_path: Path, title: str,
         _draw_emissions_bars(ax, labels, strategy_components, component_order,
                              training_emissions_mg=None)
         plt.tight_layout()
-        plt.savefig(ongoing_path, dpi=DPI)
+        plt.savefig(ongoing_path, dpi=DPI, bbox_inches="tight")
         print(f"Plot saved → {ongoing_path}")
         plt.close()
+
+
+# Segments drawn by plot_energy_summary_stacked — compare_energy_summary's
+# full section set, minus training (dwarfs everything else) and the
+# derived total/count rows (would double-count).
+_ENERGY_STACK_SECTIONS = [
+    "id_mapping_emissions_mg",
+    "checkpoint_load_emissions_mg",
+    "build_user_history_emissions_mg",
+    "embedding_snapshot_emissions_mg",
+    "content_build_emissions_mg",
+    "id_resolution_emissions_mg",
+    "recovered_history_seed_emissions_mg",
+    "expand_embeddings_emissions_mg",
+    "gt_split_emissions_mg",
+    "scoring_emissions_mg",
+    "update_prep_emissions_mg",
+    "history_update_emissions_mg",
+    "apply_content_seeds_emissions_mg",
+    "update_total_emissions_mg",
+]
+
+
+def plot_energy_summary_stacked(summary: pd.DataFrame, out_path: Path, title: str,
+                                log_y: bool = False):
+    """
+    Stacked bar chart of compare_energy_summary()'s full section breakdown
+    — one bar per run, one segment per section. Streaming only (training
+    excluded, see _ENERGY_STACK_SECTIONS). NaN sections draw as zero-height.
+
+    Outputs: <out_path>.
+    """
+    labels = list(summary.columns)
+    component_order = [s for s in _ENERGY_STACK_SECTIONS if s in summary.index]
+    strategy_components = {
+        label: {
+            section: (float(summary.loc[section, label])
+                      if pd.notna(summary.loc[section, label]) else 0.0)
+            for section in component_order
+        }
+        for label in labels
+    }
+
+    fig, ax = plt.subplots(figsize=(max(7, 2.8 * len(labels)), 6.5))
+    fig.suptitle(title, fontsize=13, wrap=True)
+    _draw_emissions_bars(ax, labels, strategy_components, component_order,
+                         training_emissions_mg=None, log_y=log_y)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=DPI, bbox_inches="tight")  # fits the outside legend
+    print(f"Plot saved → {out_path}")
+    plt.close()
 
 
 def plot_streaming_results(df: pd.DataFrame, out_path: Path,
@@ -722,6 +794,303 @@ def plot_all_strategies_comparison(df_no_update: pd.DataFrame, df_incremental: p
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
         path = Path(f"{base}_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
+
+
+def _frequency_comparison_colors(n: int) -> list:
+    """
+    n evenly-spaced colors from a perceptually uniform sequential colormap
+    (plasma, range restricted to avoid the too-light yellow end) — update
+    frequency is ordinal, so a light-to-dark ramp reads the low-to-high
+    relationship directly, unlike arbitrary categorical hues.
+    """
+    if n == 1:
+        return [mcolors.rgb2hex(cm.plasma(0.15))]
+    return [mcolors.rgb2hex(cm.plasma(t)) for t in np.linspace(0.05, 0.85, n)]
+
+
+def plot_content_incremental_frequency_comparison(runs: dict, out_path: Path, title: str,
+                                                   subtitle: str = None, smooth: int = 20):
+    """
+    Overall recall/precision/ndcg@10 for several content_incremental runs
+    at different update_every settings, one line per run — the frequency-
+    sweep counterpart to plot_all_strategies_comparison. No update-trigger
+    markers: each run has its own schedule, so a shared dashed-line set
+    doesn't apply here.
+
+    runs: {label: df}, e.g. {"Update every 270 batches": df1, ...} — label
+    order sets both legend order and color assignment (see
+    plot_content_incremental_frequency_sweep for auto-discovery + labeling).
+
+    Outputs: <out_path>_{metric}.png per metric.
+    """
+    base = Path(str(out_path).replace(".png", ""))
+    labels = list(runs.keys())
+    colors = _frequency_comparison_colors(len(labels))
+    max_x = int(max(df["interactions"].max() for df in runs.values()))
+
+    def smoothed(df, col):
+        return df[col].rolling(smooth, min_periods=1, center=True).mean()
+
+    for metric, ylabel, _ in _CONTENT_COLDSTART_METRICS:
+        col = f"{metric}_overall_content"
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        for i, label in enumerate(labels):
+            df = runs[label]
+            ax.plot(df["interactions"], smoothed(df, col), color=colors[i], linewidth=2, label=label)
+
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Interactions seen")
+        ax.set_xlim(left=0, right=max_x)
+
+        all_vals = pd.concat([runs[label][col] for label in labels])
+        y_min, y_max = all_vals.quantile(0.01), all_vals.quantile(0.99)
+        span = y_max - y_min
+        ax.set_ylim(max(0, y_min - span * 0.08), y_max + span * 0.30)
+        _add_end_xtick(ax, max_x)
+        ax.legend(loc="upper left", fontsize=9)
+        chart_title = "Update Frequency Comparison"
+        if subtitle:
+            ax.set_title(subtitle)
+            _center_suptitle_over_axes(fig, ax, chart_title)
+        else:
+            ax.set_title(chart_title)
+            _center_suptitle_over_axes(fig, ax, title)
+        path = Path(f"{base}_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
+
+
+def _discover_frequency_runs(csv_dir: Path) -> list:
+    """
+    Every content_incremental results CSV in csv_dir (*content_incremental*.csv,
+    excluding *_energy.csv sidecars), paired with its actual update_every —
+    recovered straight from the data (the batch number of its first
+    updated==True row), not guessed from n_updates or hardcoded. Returns
+    [(update_every, df, path), ...] sorted least to most frequent
+    (descending update_every); a run with no updates at all is skipped.
+    """
+    csv_paths = [p for p in sorted(Path(csv_dir).glob("*content_incremental*.csv"))
+                if "_energy" not in p.name]
+    entries = []
+    for p in csv_paths:
+        df = pd.read_csv(p)
+        update_batches = df.loc[df["updated"] == True, "batch"]
+        if update_batches.empty:
+            continue
+        entries.append((int(update_batches.iloc[0]), df, p))
+    entries.sort(key=lambda e: e[0], reverse=True)
+    return entries
+
+
+def plot_content_incremental_frequency_sweep(csv_dir: Path, out_path: Path, title: str,
+                                             subtitle: str = None, smooth: int = 20):
+    """
+    Auto-discovers every content_incremental run in csv_dir (see
+    _discover_frequency_runs) and plots them via
+    plot_content_incremental_frequency_comparison, labeled "Update every N
+    batches".
+
+    Outputs: <out_path>_{metric}.png per metric.
+    """
+    runs = {f"Update every {update_every} batch{'es' if update_every != 1 else ''}": df
+            for update_every, df, _ in _discover_frequency_runs(csv_dir)}
+    plot_content_incremental_frequency_comparison(runs, out_path, title, subtitle=subtitle, smooth=smooth)
+
+
+def plot_content_incremental_frequency_summary(csv_dir: Path, out_path: Path, title: str,
+                                               subtitle: str = None):
+    """
+    One point per content_incremental run in csv_dir (see
+    _discover_frequency_runs): x = update_every (log scale, ascending —
+    more frequent updates to the left), y = that run's mean overall
+    recall/precision/ndcg@10. The summary-statistic counterpart to
+    plot_content_incremental_frequency_sweep's full time series — shows
+    the frequency/quality trend (and where it plateaus) at a glance.
+
+    Outputs: <out_path>_{metric}.png per metric.
+    """
+    entries = sorted(_discover_frequency_runs(csv_dir), key=lambda e: e[0])
+    update_everys = [ue for ue, _, _ in entries]
+
+    for metric, ylabel, _ in _CONTENT_COLDSTART_METRICS:
+        col = f"{metric}_overall_content"
+        means = [df[col].mean() for _, df, _ in entries]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(update_everys, means, color=COLORS["incremental"], linewidth=2, marker="o", markersize=6)
+        ax.set_xscale("log")
+        ax.set_xticks(update_everys)
+        ax.set_xticklabels([str(ue) for ue in update_everys])
+        ax.set_xlabel("Update every (batches)")
+        ax.set_ylabel(f"Mean {ylabel}")
+        y_min, y_max = min(means), max(means)
+        pad = (y_max - y_min) * 0.15
+        ax.set_ylim(max(0, y_min - pad), y_max + pad)
+        chart_title = "Update Frequency vs Quality"
+        if subtitle:
+            ax.set_title(subtitle)
+            _center_suptitle_over_axes(fig, ax, chart_title)
+        else:
+            ax.set_title(chart_title)
+            _center_suptitle_over_axes(fig, ax, title)
+        path = Path(f"{str(out_path).replace('.png', '')}_{metric}.png")
+        plt.savefig(path, dpi=DPI)
+        print(f"Plot saved → {path}")
+        plt.close()
+
+
+def _frequency_run_energies(entries: list) -> list:
+    """
+    streaming_emissions_mg per (update_every, df, path) entry from
+    _discover_frequency_runs, read from each run's *_energy.csv sidecar
+    (same basename as its results CSV) — None where the sidecar is missing.
+    """
+    energies = []
+    for _, _, path in entries:
+        energy_path = Path(str(path).replace(".csv", "_energy.csv"))
+        if energy_path.exists():
+            energies.append(pd.read_csv(energy_path).iloc[0]["streaming_emissions_mg"])
+        else:
+            energies.append(None)
+    return energies
+
+
+def _knee_point_index(xs: list, ys: list) -> int:
+    """
+    Index of the knee/elbow point on (xs, ys), via the kneed package's
+    KneeLocator (the standard reference implementation of the Kneedle
+    algorithm, Satopaa et al. 2011) — concave, increasing curve (quality
+    rises with cost, climbs steeply then flattens). xs/ys are used in the
+    order given, so callers should already be sorted along x ascending.
+    """
+    from kneed import KneeLocator
+    knee_x = KneeLocator(xs, ys, curve="concave", direction="increasing").knee
+    return xs.index(knee_x)
+
+
+def _sagitta_feet(xs: list, ys: list) -> list:
+    """
+    For every point, the foot of its perpendicular onto the chord from the
+    first to the last point — i.e. where each point's "sagitta" segment
+    (see https://github.com/vlavorini/kneefinder) lands on the chord.
+    xs/ys are assumed already min-max normalized to [0, 1] (equal footing
+    for both axes — required for the perpendicular to be geometrically
+    meaningful, and to render at a true 90° once plotted on equal-aspect
+    axes; see plot_content_incremental_quality_vs_energy).
+    Returns [(foot_x, foot_y), ...], one per input point.
+    """
+    x0, y0 = xs[0], ys[0]
+    x1, y1 = xs[-1], ys[-1]
+    dx, dy = x1 - x0, y1 - y0
+    denom = dx * dx + dy * dy
+
+    feet = []
+    for px, py in zip(xs, ys):
+        t = ((px - x0) * dx + (py - y0) * dy) / denom if denom else 0.0
+        feet.append((x0 + t * dx, y0 + t * dy))
+    return feet
+
+
+def plot_content_incremental_quality_vs_energy(csv_dir: Path, out_path: Path, title: str,
+                                               subtitle: str = None):
+    """
+    Quality plotted directly against energy cost — x = streaming energy
+    (mg CO2eq), y = mean recall/precision/ndcg@10, one point per
+    content_incremental run in csv_dir, connected in update-frequency
+    order (least to most frequent). The classic accuracy-vs-cost curve: it
+    climbs steeply then bends over while x keeps climbing — diminishing
+    returns made visible directly.
+
+    Sagitta-style construction (https://github.com/vlavorini/kneefinder):
+    blue curve, orange reference chord from the cheapest to the priciest
+    run, and a thin red perpendicular segment from every point to that
+    chord — the knee is whichever segment is longest, drawn thicker so
+    it's visually obvious which one "wins," not just asserted. Plotted in
+    min-max-normalized [0, 1] space with equal-aspect axes (mg CO2eq and a
+    0-1 metric have no shared unit, so raw-unit axes would visually skew
+    the "perpendicular" segments away from true 90°) — tick labels are
+    then relabeled back to the real energy/quality values.
+
+    Each point is labeled with its update_every (energy alone doesn't say
+    how frequently that run updated). A run without an *_energy.csv
+    sidecar is dropped (no x position).
+
+    Outputs: <out_path>_{metric}.png per metric.
+    """
+    entries = sorted(_discover_frequency_runs(csv_dir), key=lambda e: e[0], reverse=True)
+    energies = _frequency_run_energies(entries)
+    valid = [(ue, df, e) for (ue, df, _), e in zip(entries, energies) if e is not None]
+
+    for metric, ylabel, _ in _CONTENT_COLDSTART_METRICS:
+        col = f"{metric}_overall_content"
+        xs = [e for _, _, e in valid]
+        ys = [df[col].mean() for _, df, _ in valid]
+        point_labels = [ue for ue, _, _ in valid]
+        knee = _knee_point_index(xs, ys)
+
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        xn = [(x - x_min) / (x_max - x_min) for x in xs]
+        yn = [(y - y_min) / (y_max - y_min) for y in ys]
+        feet = _sagitta_feet(xn, yn)
+
+        fig, ax = plt.subplots(figsize=(7.5, 7.5))
+        pad = 0.08
+        ax.set_xlim(-pad, 1 + pad)
+        ax.set_ylim(-pad, 1 + pad)
+        ax.set_aspect("equal")
+
+        ax.plot([xn[0], xn[-1]], [yn[0], yn[-1]], color="#555555", linewidth=1.5,
+               zorder=1, label="Reference chord")
+        for i, (x, y) in enumerate(zip(xn, yn)):
+            fx, fy = feet[i]
+            is_knee = i == knee
+            ax.plot([x, fx], [y, fy], color=COLORS["no_update"] if is_knee else "#bbbbbb",
+                   linewidth=2.5 if is_knee else 1, zorder=2)
+        ax.plot(xn, yn, color="#0072B2", linewidth=2, marker="o", markersize=7, zorder=3,
+               label="Quality vs. energy")
+        ax.scatter([xn[knee]], [yn[knee]], color=COLORS["no_update"], marker="o",
+                  s=90, zorder=4, label=f"Knee: update every {point_labels[knee]} batches")
+        n = len(xn)
+        for i, (x, y, ue) in enumerate(zip(xn, yn, point_labels)):
+            # Offset each label perpendicular to the curve's local direction
+            # (not a fixed straight-up offset) so it clears the line even on
+            # the steep early segments, where "up" runs almost parallel to
+            # the curve itself and the label ends up sitting on top of it.
+            j0 = i if i == 0 else i - 1
+            j1 = i if i == n - 1 else i + 1
+            dx, dy = xn[j1] - xn[j0], yn[j1] - yn[j0]
+            nx, ny = -dy, dx
+            norm = (nx ** 2 + ny ** 2) ** 0.5
+            nx, ny = (nx / norm, ny / norm) if norm else (0.0, 1.0)
+            mag = 14
+            ax.annotate(str(ue), (x, y), textcoords="offset points",
+                       xytext=(nx * mag, ny * mag),
+                       ha="center", va="center", fontsize=8, color="#555555", zorder=5,
+                       fontweight="bold",
+                       bbox=dict(facecolor="white", edgecolor="none", alpha=1.0, pad=2))
+
+        tick_fracs = [0.0, 0.25, 0.5, 0.75, 1.0]
+        ax.set_xticks(tick_fracs)
+        ax.set_xticklabels([f"{x_min + t * (x_max - x_min):,.0f}" for t in tick_fracs])
+        ax.set_yticks(tick_fracs)
+        ax.set_yticklabels([f"{y_min + t * (y_max - y_min):.4f}" for t in tick_fracs])
+        ax.set_xlabel("Streaming energy (mg CO2eq)")
+        ax.set_ylabel(f"Mean {ylabel}")
+        ax.legend(loc="lower right", fontsize=8)
+        chart_title = "Quality vs Energy Cost"
+        if subtitle:
+            ax.set_title(subtitle)
+            _center_suptitle_over_axes(fig, ax, chart_title)
+        else:
+            ax.set_title(chart_title)
+            _center_suptitle_over_axes(fig, ax, title)
+        path = Path(f"{str(out_path).replace('.png', '')}_{metric}.png")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()

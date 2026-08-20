@@ -26,6 +26,7 @@ Python usage:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -36,7 +37,8 @@ from scipy.stats import wilcoxon
 ROOT = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(ROOT))
 
-from tools.plot_utils import METRIC_LABELS, _CONTENT_COLDSTART_METRICS
+from tools.plot_utils import (METRIC_LABELS, _CONTENT_COLDSTART_METRICS, plot_energy_summary_stacked,
+                              _discover_frequency_runs, _frequency_run_energies)
 
 
 def compare_columns(df_a: pd.DataFrame, col_a: str, label_a: str,
@@ -321,6 +323,53 @@ def compare_full_retrain_vs_all(full_retrain_csv, no_update_csv, incremental_csv
     return summary
 
 
+def compare_frequency_sweep_vs_baseline(csv_dir, baseline_update_every: int = 270,
+                                        out: Path = None, latex: Path = None) -> pd.DataFrame:
+    """
+    Compares every content_incremental update-frequency run discovered in
+    csv_dir (see plot_utils._discover_frequency_runs — the same set of runs
+    behind plot_content_incremental_quality_vs_energy) against one baseline
+    frequency, default 270 (the least frequent / cheapest run in the sweep).
+    One row per update_every value, columns = % improvement in Recall@10,
+    Precision@10, NDCG@10 ("{metric}_overall_content", batch-for-batch via
+    compare_columns) and % change in streaming energy
+    (streaming_emissions_mg, from each run's *_energy.csv sidecar), all
+    relative to the baseline run.
+
+    Outputs (results/frequency_change/):
+    yelp_content_incremental_frequency_vs_baseline_compare.csv,
+    ...vs_baseline_compare.tex
+    """
+    entries = _discover_frequency_runs(csv_dir)
+    energies = _frequency_run_energies(entries)
+    valid = {ue: (df, e) for (ue, df, _), e in zip(entries, energies) if e is not None}
+
+    if baseline_update_every not in valid:
+        raise ValueError(f"baseline_update_every={baseline_update_every} not found among "
+                         f"discovered runs: {sorted(valid, reverse=True)}")
+
+    df_base, e_base = valid[baseline_update_every]
+    metrics = ["recall", "precision", "ndcg"]
+
+    print(f"csv_dir:  {csv_dir}")
+    print(f"baseline: update every {baseline_update_every} batches\n")
+
+    rows = []
+    for ue in sorted(valid, reverse=True):
+        df_ue, e_ue = valid[ue]
+        row = {"update_every": ue}
+        for m in metrics:
+            cmp = compare_columns(df_base, f"{m}_overall_content", "baseline",
+                                  df_ue, f"{m}_overall_content", "run")
+            row[f"pct_{m}"] = cmp["pct_improvement"]
+        row["pct_energy"] = (e_ue - e_base) / e_base * 100 if e_base else float("nan")
+        rows.append(row)
+
+    summary = pd.DataFrame(rows).set_index("update_every")
+    _report(summary, out, latex)
+    return summary
+
+
 def compare_update_cost(strategy_csvs: dict, training_emissions_mg: float = None,
                         out: Path = None, latex: Path = None) -> pd.DataFrame:
     """
@@ -520,9 +569,9 @@ def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 10
     return summary
 
 
-# Row order for compare_energy_summary's transposed table — top to bottom
-# mirrors the order each section is actually measured in a run (setup,
-# then content build, then the batch loop, then updates, then totals).
+# Row order for compare_energy_summary's transposed table. A section NaN
+# for a run means that phase doesn't apply to it (e.g. update_prep is
+# hybrid-only, apply_content_seeds is content-only).
 _ENERGY_SUMMARY_SECTIONS = [
     "training_emissions_mg",
     "id_mapping_emissions_mg",
@@ -530,6 +579,14 @@ _ENERGY_SUMMARY_SECTIONS = [
     "build_user_history_emissions_mg",
     "embedding_snapshot_emissions_mg",
     "content_build_emissions_mg",
+    "id_resolution_emissions_mg",
+    "recovered_history_seed_emissions_mg",
+    "expand_embeddings_emissions_mg",
+    "gt_split_emissions_mg",
+    "scoring_emissions_mg",
+    "update_prep_emissions_mg",
+    "history_update_emissions_mg",
+    "apply_content_seeds_emissions_mg",
     "batch_total_emissions_mg",
     "update_total_emissions_mg",
     "n_updates",
@@ -538,72 +595,120 @@ _ENERGY_SUMMARY_SECTIONS = [
     "grand_total_mg",
 ]
 
+# Sub-task columns summed out of each per-batch results CSV (not the energy
+# sidecar) for the batch-loop breakdown rows above.
+_HYBRID_BATCH_SUBTASKS = [
+    "id_resolution_emissions_mg", "expand_embeddings_emissions_mg",
+    "scoring_emissions_mg", "update_prep_emissions_mg", "history_update_emissions_mg",
+]
+_CONTENT_BATCH_SUBTASKS = [
+    "id_resolution_emissions_mg", "recovered_history_seed_emissions_mg",
+    "expand_embeddings_emissions_mg", "gt_split_emissions_mg", "scoring_emissions_mg",
+    "history_update_emissions_mg", "apply_content_seeds_emissions_mg",
+]
 
-def compare_energy_summary(no_update_csv, incremental_csv,
-                           content_coldstart_csv, content_incremental_csv,
-                           out: Path = None, latex: Path = None) -> pd.DataFrame:
+
+def _energy_from_hybrid(csv_path, results_csv_path, strategy):
+    row = pd.read_csv(csv_path).iloc[0]
+    results = pd.read_csv(results_csv_path)
+    section_row = {
+        "training_emissions_mg":           row.get("training_emissions_mg", 0.0),
+        "id_mapping_emissions_mg":          row.get(f"{strategy}_id_mapping_emissions_mg", float("nan")),
+        "checkpoint_load_emissions_mg":     row.get(f"{strategy}_checkpoint_load_emissions_mg", float("nan")),
+        "build_user_history_emissions_mg":  row.get(f"{strategy}_build_user_history_emissions_mg", float("nan")),
+        "embedding_snapshot_emissions_mg":  float("nan"),
+        "content_build_emissions_mg":       float("nan"),
+        "recovered_history_seed_emissions_mg": float("nan"),
+        "gt_split_emissions_mg":            float("nan"),
+        "apply_content_seeds_emissions_mg": float("nan"),
+        "batch_total_emissions_mg":         row.get(f"{strategy}_total_batch_emissions_mg", float("nan")),
+        "update_total_emissions_mg":        row.get(f"{strategy}_total_update_emissions_mg", 0.0),
+        "n_updates":                        int(row.get(f"{strategy}_n_updates", 0)),
+        "avg_emissions_per_update_mg":      row.get(f"{strategy}_avg_emissions_per_update_mg", 0.0),
+        "streaming_emissions_mg":           row.get(f"{strategy}_streaming_emissions_mg", float("nan")),
+    }
+    for col in _HYBRID_BATCH_SUBTASKS:
+        section_row[col] = results[col].sum() if col in results.columns else float("nan")
+    return section_row
+
+
+def _energy_from_content(csv_path, results_csv_path):
+    row = pd.read_csv(csv_path).iloc[0]
+    results = pd.read_csv(results_csv_path)
+    section_row = {
+        "training_emissions_mg":           row.get("training_emissions_mg", 0.0),
+        "id_mapping_emissions_mg":          row.get("id_mapping_emissions_mg", float("nan")),
+        "checkpoint_load_emissions_mg":     row.get("checkpoint_load_emissions_mg", float("nan")),
+        "build_user_history_emissions_mg":  row.get("build_user_history_emissions_mg", float("nan")),
+        "embedding_snapshot_emissions_mg":  row.get("embedding_snapshot_emissions_mg", float("nan")),
+        "content_build_emissions_mg":       row.get("content_build_emissions_mg", float("nan")),
+        "update_prep_emissions_mg":         float("nan"),
+        "batch_total_emissions_mg":         row.get("total_batch_emissions_mg", float("nan")),
+        "update_total_emissions_mg":        row.get("total_update_emissions_mg", 0.0),
+        "n_updates":                        int(row.get("n_updates", 0)),
+        "avg_emissions_per_update_mg":      row.get("avg_emissions_per_update_mg", 0.0),
+        "streaming_emissions_mg":           row.get("streaming_emissions_mg", float("nan")),
+    }
+    for col in _CONTENT_BATCH_SUBTASKS:
+        section_row[col] = results[col].sum() if col in results.columns else float("nan")
+    return section_row
+
+
+def _energy_from_legacy_full_retrain(training_json_path, results_csv_path) -> dict:
     """
-    Builds one energy/emissions column per run — no_update and incremental
-    (from a run_incremental_lightgcn.py "*_hybrid_emissions_summary" CSV,
-    "{strategy}_"-prefixed columns) and content_coldstart /
-    content_incremental (from their own "*_energy.csv" sidecars, flat
-    column names) — normalized into one common section schema so all four
-    are directly comparable, despite coming from differently-shaped source
-    files. A section that doesn't apply to a run at all (e.g.
-    content_build for a plain hybrid run) is NaN; a mechanism that exists
-    but never fired (e.g. updates for no_update) is 0.
-
-    Rows = sections (id_mapping, checkpoint_load, build_user_history,
-    embedding_snapshot, content_build, batch_total, update_total,
-    n_updates, avg_emissions_per_update_mg, streaming_emissions_mg,
-    grand_total_mg), columns = the four runs — transposed from the old
-    one-row-per-run layout, which got too wide once every run started
-    reporting 8+ separately-tracked sections.
-
-    Outputs: prints table; saves to `out`/`latex` if given.
+    For a full_retrain run that predates this session's section-breakdown
+    tracking — only a bare {"training_emissions_mg": ...} JSON and a
+    results CSV with update_emissions_mg/updated, no other sections
+    measured at all, so everything else is NaN.
     """
-    def from_hybrid(csv_path, strategy):
-        row = pd.read_csv(csv_path).iloc[0]
-        return {
-            "training_emissions_mg":           row.get("training_emissions_mg", 0.0),
-            "id_mapping_emissions_mg":          row.get(f"{strategy}_id_mapping_emissions_mg", float("nan")),
-            "checkpoint_load_emissions_mg":     row.get(f"{strategy}_checkpoint_load_emissions_mg", float("nan")),
-            "build_user_history_emissions_mg":  row.get(f"{strategy}_build_user_history_emissions_mg", float("nan")),
-            "embedding_snapshot_emissions_mg":  float("nan"),
-            "content_build_emissions_mg":       float("nan"),
-            "batch_total_emissions_mg":         row.get(f"{strategy}_total_batch_emissions_mg", float("nan")),
-            "update_total_emissions_mg":        row.get(f"{strategy}_total_update_emissions_mg", 0.0),
-            "n_updates":                        int(row.get(f"{strategy}_n_updates", 0)),
-            "avg_emissions_per_update_mg":      row.get(f"{strategy}_avg_emissions_per_update_mg", 0.0),
-            "streaming_emissions_mg":           row.get(f"{strategy}_streaming_emissions_mg", float("nan")),
-        }
+    training_emissions_mg = json.loads(Path(training_json_path).read_text())["training_emissions_mg"]
+    results = pd.read_csv(results_csv_path)
+    n_updates = int(results["updated"].sum())
+    update_total = results["update_emissions_mg"].sum()
+    return {
+        "training_emissions_mg":               training_emissions_mg,
+        "id_mapping_emissions_mg":              float("nan"),
+        "checkpoint_load_emissions_mg":         float("nan"),
+        "build_user_history_emissions_mg":      float("nan"),
+        "embedding_snapshot_emissions_mg":      float("nan"),
+        "content_build_emissions_mg":           float("nan"),
+        "id_resolution_emissions_mg":           float("nan"),
+        "recovered_history_seed_emissions_mg":  float("nan"),
+        "expand_embeddings_emissions_mg":       float("nan"),
+        "gt_split_emissions_mg":                float("nan"),
+        "scoring_emissions_mg":                 float("nan"),
+        "update_prep_emissions_mg":             float("nan"),
+        "history_update_emissions_mg":          float("nan"),
+        "apply_content_seeds_emissions_mg":     float("nan"),
+        "batch_total_emissions_mg":             float("nan"),
+        "update_total_emissions_mg":            update_total,
+        "n_updates":                            n_updates,
+        "avg_emissions_per_update_mg":          update_total / max(n_updates, 1),
+        "streaming_emissions_mg":               float("nan"),
+    }
 
-    def from_content(csv_path):
-        row = pd.read_csv(csv_path).iloc[0]
-        return {
-            "training_emissions_mg":           row.get("training_emissions_mg", 0.0),
-            "id_mapping_emissions_mg":          row.get("id_mapping_emissions_mg", float("nan")),
-            "checkpoint_load_emissions_mg":     row.get("checkpoint_load_emissions_mg", float("nan")),
-            "build_user_history_emissions_mg":  row.get("build_user_history_emissions_mg", float("nan")),
-            "embedding_snapshot_emissions_mg":  row.get("embedding_snapshot_emissions_mg", float("nan")),
-            "content_build_emissions_mg":       row.get("content_build_emissions_mg", float("nan")),
-            "batch_total_emissions_mg":         row.get("total_batch_emissions_mg", float("nan")),
-            "update_total_emissions_mg":        row.get("total_update_emissions_mg", 0.0),
-            "n_updates":                        int(row.get("n_updates", 0)),
-            "avg_emissions_per_update_mg":      row.get("avg_emissions_per_update_mg", 0.0),
-            "streaming_emissions_mg":           row.get("streaming_emissions_mg", float("nan")),
-        }
 
-    print(f"no_update:           {no_update_csv}")
-    print(f"incremental:         {incremental_csv}")
-    print(f"content_coldstart:   {content_coldstart_csv}")
-    print(f"content_incremental: {content_incremental_csv}\n")
+def compare_energy_summary_hybrid(no_update_csv, no_update_results_csv,
+                                  incremental_csv, incremental_results_csv,
+                                  full_retrain_training_json, full_retrain_results_csv,
+                                  out: Path = None, latex: Path = None, plot: Path = None) -> pd.DataFrame:
+    """
+    3-way energy comparison for run_incremental_lightgcn.py's hybrid
+    strategies only — no content mechanism required (e.g. the MovieLens
+    no_update/incremental/full_retrain comparison). full_retrain here is
+    read from its legacy training-only JSON + results CSV (predates this
+    session's section-breakdown tracking), so most of its sections are NaN.
+
+    Outputs: prints table; saves to `out`/`latex`/`plot` if given.
+    """
+    print(f"no_update:    {no_update_csv} / {no_update_results_csv}")
+    print(f"incremental:  {incremental_csv} / {incremental_results_csv}")
+    print(f"full_retrain: {full_retrain_training_json} / {full_retrain_results_csv}\n")
 
     columns = {
-        "no_update":           from_hybrid(no_update_csv, "no_update"),
-        "incremental":         from_hybrid(incremental_csv, "incremental"),
-        "content_coldstart":   from_content(content_coldstart_csv),
-        "content_incremental": from_content(content_incremental_csv),
+        "no_update":    _energy_from_hybrid(no_update_csv, no_update_results_csv, "no_update"),
+        "incremental":  _energy_from_hybrid(incremental_csv, incremental_results_csv, "incremental"),
+        "full_retrain": _energy_from_legacy_full_retrain(full_retrain_training_json, full_retrain_results_csv),
     }
     summary = pd.DataFrame(columns).reindex(_ENERGY_SUMMARY_SECTIONS[:-1])
     summary.loc["grand_total_mg"] = summary.loc["training_emissions_mg"] + summary.loc["streaming_emissions_mg"]
@@ -622,6 +727,117 @@ def compare_energy_summary(no_update_csv, incremental_csv,
             else:
                 formatted.loc[section] = formatted.loc[section].map(
                     lambda x: f"{x:,.0f}" if pd.notna(x) else "--")
+        Path(latex).write_text(formatted.reset_index().to_latex(index=False))
+        print(f"LaTeX table saved → {latex}")
+    if plot:
+        plot_energy_summary_stacked(summary, plot, "Energy Breakdown by Run")
+    return summary
+
+
+def _energy_summary_columns(no_update_csv, no_update_results_csv,
+                            incremental_csv, incremental_results_csv,
+                            content_coldstart_csv, content_coldstart_results_csv,
+                            content_incremental_csv, content_incremental_results_csv) -> dict:
+    """One section dict per run — shared by compare_energy_summary and
+    compare_energy_summary_compact so both read the source files exactly
+    the same way."""
+    print(f"no_update:           {no_update_csv} / {no_update_results_csv}")
+    print(f"incremental:         {incremental_csv} / {incremental_results_csv}")
+    print(f"content_coldstart:   {content_coldstart_csv} / {content_coldstart_results_csv}")
+    print(f"content_incremental: {content_incremental_csv} / {content_incremental_results_csv}\n")
+
+    return {
+        "no_update":           _energy_from_hybrid(no_update_csv, no_update_results_csv, "no_update"),
+        "incremental":         _energy_from_hybrid(incremental_csv, incremental_results_csv, "incremental"),
+        "content_coldstart":   _energy_from_content(content_coldstart_csv, content_coldstart_results_csv),
+        "content_incremental": _energy_from_content(content_incremental_csv, content_incremental_results_csv),
+    }
+
+
+def compare_energy_summary(no_update_csv, no_update_results_csv,
+                           incremental_csv, incremental_results_csv,
+                           content_coldstart_csv, content_coldstart_results_csv,
+                           content_incremental_csv, content_incremental_results_csv,
+                           out: Path = None, latex: Path = None, plot: Path = None) -> pd.DataFrame:
+    """
+    One energy/emissions column per run — no_update/incremental read from a
+    run_incremental_lightgcn.py "*_hybrid_emissions_summary" CSV,
+    content_coldstart/content_incremental from their own "*_energy.csv" —
+    normalized into one common section schema. `*_results_csv` args are
+    each run's per-batch results CSV, needed for the batch-loop sub-task
+    breakdown (only lives per-batch, summed here). Rows = sections,
+    columns = runs. See compare_energy_summary_compact for a shorter,
+    thesis-table-sized version.
+
+    `plot`, if given, saves a stacked-bar-chart PNG via
+    plot_utils.plot_energy_summary_stacked.
+
+    Outputs: prints table; saves to `out`/`latex`/`plot` if given.
+    """
+    columns = _energy_summary_columns(no_update_csv, no_update_results_csv,
+                                      incremental_csv, incremental_results_csv,
+                                      content_coldstart_csv, content_coldstart_results_csv,
+                                      content_incremental_csv, content_incremental_results_csv)
+    summary = pd.DataFrame(columns).reindex(_ENERGY_SUMMARY_SECTIONS[:-1])
+    summary.loc["grand_total_mg"] = summary.loc["training_emissions_mg"] + summary.loc["streaming_emissions_mg"]
+    summary.index.name = "section"
+
+    pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
+    print(summary.to_string())
+    if out:
+        summary.to_csv(out)
+        print(f"\nSummary saved → {out}")
+    if latex:
+        formatted = summary.astype(object)
+        for section in formatted.index:
+            if section == "n_updates":
+                formatted.loc[section] = formatted.loc[section].map(lambda x: f"{int(x)}")
+            else:
+                formatted.loc[section] = formatted.loc[section].map(
+                    lambda x: f"{x:,.0f}" if pd.notna(x) else "--")
+        Path(latex).write_text(formatted.reset_index().to_latex(index=False))
+        print(f"LaTeX table saved → {latex}")
+    if plot:
+        plot_energy_summary_stacked(summary, plot, "Energy Breakdown by Run")
+    return summary
+
+
+def compare_energy_summary_compact(no_update_csv, no_update_results_csv,
+                                   incremental_csv, incremental_results_csv,
+                                   content_coldstart_csv, content_coldstart_results_csv,
+                                   content_incremental_csv, content_incremental_results_csv,
+                                   out: Path = None, latex: Path = None) -> pd.DataFrame:
+    """
+    Compact, thesis-table-sized energy summary — one row per run, four
+    columns: streaming, content_init (content_build + recovered_history_seed
+    + apply_content_seeds), update_total, expand_embeddings.
+
+    Outputs: prints table; saves to `out`/`latex` if given.
+    """
+    columns = _energy_summary_columns(no_update_csv, no_update_results_csv,
+                                      incremental_csv, incremental_results_csv,
+                                      content_coldstart_csv, content_coldstart_results_csv,
+                                      content_incremental_csv, content_incremental_results_csv)
+    runs = pd.DataFrame(columns).T
+    summary = pd.DataFrame({
+        "streaming_emissions_mg":         runs["streaming_emissions_mg"],
+        "content_init_emissions_mg":      runs["content_build_emissions_mg"]
+                                           + runs["recovered_history_seed_emissions_mg"]
+                                           + runs["apply_content_seeds_emissions_mg"],
+        "update_total_emissions_mg":      runs["update_total_emissions_mg"],
+        "expand_embeddings_emissions_mg": runs["expand_embeddings_emissions_mg"],
+    })
+    summary.index.name = "run"
+
+    pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
+    print(summary.to_string())
+    if out:
+        summary.to_csv(out)
+        print(f"\nSummary saved → {out}")
+    if latex:
+        formatted = summary.astype(object)
+        for col in formatted.columns:
+            formatted[col] = formatted[col].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "--")
         Path(latex).write_text(formatted.reset_index().to_latex(index=False))
         print(f"LaTeX table saved → {latex}")
     return summary
@@ -698,19 +914,61 @@ def main():
 
     p8 = sub.add_parser("energy-summary",
                         help="Compare energy/emissions across no_update, incremental, "
-                             "content_coldstart, and content_incremental")
+                             "content_coldstart, and content_incremental, including the "
+                             "full per-batch sub-task breakdown (scoring, id_resolution, etc.)")
     p8.add_argument("--no-update-csv", type=Path, required=True,
                     help="A run_incremental_lightgcn.py *_hybrid_emissions_summary CSV "
                          "(no_update run)")
+    p8.add_argument("--no-update-results-csv", type=Path, required=True,
+                    help="The matching *_hybrid_results_no_update_*.csv (per-batch)")
     p8.add_argument("--incremental-csv", type=Path, required=True,
                     help="A run_incremental_lightgcn.py *_hybrid_emissions_summary CSV "
                          "(incremental run)")
+    p8.add_argument("--incremental-results-csv", type=Path, required=True,
+                    help="The matching *_hybrid_results_incremental_*.csv (per-batch)")
     p8.add_argument("--content-coldstart-csv", type=Path, required=True,
                     help="A run_content_coldstart.py *_energy.csv sidecar")
+    p8.add_argument("--content-coldstart-results-csv", type=Path, required=True,
+                    help="The matching *_content_coldstart_*.csv (per-batch, without _energy suffix)")
     p8.add_argument("--content-incremental-csv", type=Path, required=True,
                     help="A run_content_incremental.py *_energy.csv sidecar")
+    p8.add_argument("--content-incremental-results-csv", type=Path, required=True,
+                    help="The matching *_content_incremental_*.csv (per-batch, without _energy suffix)")
     p8.add_argument("--out", type=Path, default=None)
     p8.add_argument("--latex", type=Path, default=None)
+    p8.add_argument("--plot", type=Path, default=None,
+                    help="Save a stacked-bar-chart PNG of the full breakdown "
+                         "(one bar per run, streaming only, training excluded)")
+
+    p8b = sub.add_parser("energy-summary-compact",
+                         help="Compact, thesis-table-sized energy summary — one row per "
+                              "run: streaming, content_build, seeding, update_total, "
+                              "expand_embeddings. Same inputs as energy-summary.")
+    p8b.add_argument("--no-update-csv", type=Path, required=True)
+    p8b.add_argument("--no-update-results-csv", type=Path, required=True)
+    p8b.add_argument("--incremental-csv", type=Path, required=True)
+    p8b.add_argument("--incremental-results-csv", type=Path, required=True)
+    p8b.add_argument("--content-coldstart-csv", type=Path, required=True)
+    p8b.add_argument("--content-coldstart-results-csv", type=Path, required=True)
+    p8b.add_argument("--content-incremental-csv", type=Path, required=True)
+    p8b.add_argument("--content-incremental-results-csv", type=Path, required=True)
+    p8b.add_argument("--out", type=Path, default=None)
+    p8b.add_argument("--latex", type=Path, default=None)
+
+    p8c = sub.add_parser("energy-summary-hybrid",
+                         help="3-way hybrid-only energy comparison — no_update/incremental/"
+                              "full_retrain, no content mechanism required (e.g. MovieLens)")
+    p8c.add_argument("--no-update-csv", type=Path, required=True)
+    p8c.add_argument("--no-update-results-csv", type=Path, required=True)
+    p8c.add_argument("--incremental-csv", type=Path, required=True)
+    p8c.add_argument("--incremental-results-csv", type=Path, required=True)
+    p8c.add_argument("--full-retrain-training-json", type=Path, required=True,
+                     help="Legacy training-only JSON sidecar for full_retrain "
+                          "(no section breakdown available)")
+    p8c.add_argument("--full-retrain-results-csv", type=Path, required=True)
+    p8c.add_argument("--out", type=Path, default=None)
+    p8c.add_argument("--latex", type=Path, default=None)
+    p8c.add_argument("--plot", type=Path, default=None)
 
     p9 = sub.add_parser("full-retrain-vs-all",
                         help="Compare full_retrain against no_update and incremental "
@@ -722,6 +980,16 @@ def main():
                     help="Restrict to one metric column; default is every shared metric")
     p9.add_argument("--out", type=Path, default=None)
     p9.add_argument("--latex", type=Path, default=None)
+
+    p9b = sub.add_parser("frequency-vs-baseline",
+                         help="Compare every content_incremental update-frequency run in a "
+                              "directory against one baseline frequency (default: 270)")
+    p9b.add_argument("--csv-dir", type=Path, required=True,
+                     help="Directory of content_incremental run CSVs + *_energy.csv sidecars "
+                          "(e.g. results/frequency_change/)")
+    p9b.add_argument("--baseline-update-every", type=int, default=270)
+    p9b.add_argument("--out", type=Path, default=None)
+    p9b.add_argument("--latex", type=Path, default=None)
 
     p10 = sub.add_parser("update-cost",
                          help="Summarize update_emissions_mg per strategy — n_updates, "
@@ -759,12 +1027,29 @@ def main():
         compare_content_init_vs_incremental(args.content_csv, args.incremental_csv,
                                             metric=args.metric, out=args.out, latex=args.latex)
     elif args.command == "energy-summary":
-        compare_energy_summary(args.no_update_csv, args.incremental_csv,
-                               args.content_coldstart_csv, args.content_incremental_csv,
+        compare_energy_summary(args.no_update_csv, args.no_update_results_csv,
+                               args.incremental_csv, args.incremental_results_csv,
+                               args.content_coldstart_csv, args.content_coldstart_results_csv,
+                               args.content_incremental_csv, args.content_incremental_results_csv,
+                               out=args.out, latex=args.latex, plot=args.plot)
+    elif args.command == "energy-summary-compact":
+        compare_energy_summary_compact(args.no_update_csv, args.no_update_results_csv,
+                               args.incremental_csv, args.incremental_results_csv,
+                               args.content_coldstart_csv, args.content_coldstart_results_csv,
+                               args.content_incremental_csv, args.content_incremental_results_csv,
                                out=args.out, latex=args.latex)
+    elif args.command == "energy-summary-hybrid":
+        compare_energy_summary_hybrid(args.no_update_csv, args.no_update_results_csv,
+                               args.incremental_csv, args.incremental_results_csv,
+                               args.full_retrain_training_json, args.full_retrain_results_csv,
+                               out=args.out, latex=args.latex, plot=args.plot)
     elif args.command == "full-retrain-vs-all":
         compare_full_retrain_vs_all(args.full_retrain_csv, args.no_update_csv, args.incremental_csv,
                                     metric=args.metric, out=args.out, latex=args.latex)
+    elif args.command == "frequency-vs-baseline":
+        compare_frequency_sweep_vs_baseline(args.csv_dir,
+                                            baseline_update_every=args.baseline_update_every,
+                                            out=args.out, latex=args.latex)
     elif args.command == "update-cost":
         strategy_csvs = dict(item.split("=", 1) for item in args.csv)
         compare_update_cost(strategy_csvs, training_emissions_mg=args.training_emissions_mg,
