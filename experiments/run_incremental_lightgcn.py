@@ -72,6 +72,17 @@ DATASET_CONFIGS = {
         "checkpoint":       "saved/compatible/LightGCN-yelp-historical.pth",
         "id_cast":          lambda x: str(x),
     },
+    # Identical to "yelp" except that the realtime stream is ordered by timestamp
+    # instead of by user. Same historical split, same checkpoint — only the order
+    # in which the stream is consumed differs, so results are directly comparable.
+    "yelp-timeorder": {
+        "dataset":          "yelp-historical",
+        "historical_path":  "dataset/yelp-historical/yelp-historical.inter",
+        "realtime_path":    "dataset/yelp-realtime-timeOrder/yelp-realtime-timeOrder.inter",
+        "config_files":     ["configs/yelp_dataset.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":       "saved/compatible/LightGCN-yelp-historical.pth",
+        "id_cast":          lambda x: str(x),
+    },
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -469,7 +480,7 @@ STRATEGIES = ["no_update", "incremental", "full_retrain"]
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["ml-1m", "yelp"], required=True,
+    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder"], required=True,
                         help="Dataset to run the experiment on")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                         help="Directory to save results (default: results/)")

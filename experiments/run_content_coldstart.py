@@ -392,7 +392,7 @@ def merge_no_update_overall(df: pd.DataFrame, no_update_csv: Path) -> pd.DataFra
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["yelp"], default="yelp",
+    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder"], default="yelp",
                         help="Only yelp supported (requires yelp.item metadata)")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Existing results CSV — skip streaming, just re-plot")
@@ -412,8 +412,9 @@ def main():
     cfg = DATASET_CONFIGS[args.dataset].copy()
 
     ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_csv = results_dir / f"yelp_content_coldstart_{ts}.csv"
-    out_png = results_dir / f"yelp_content_coldstart_{ts}.png"
+    prefix  = args.dataset.replace("-", "")
+    out_csv = results_dir / f"{prefix}_content_coldstart_{ts}.csv"
+    out_png = results_dir / f"{prefix}_content_coldstart_{ts}.png"
 
     if args.csv:
         df = pd.read_csv(args.csv)

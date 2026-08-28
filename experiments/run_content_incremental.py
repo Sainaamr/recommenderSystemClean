@@ -419,7 +419,7 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["yelp"], default="yelp",
+    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder"], default="yelp",
                         help="Only yelp supported (requires yelp.item metadata)")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Existing results CSV — skip streaming, just re-plot")
@@ -440,8 +440,9 @@ def main():
         cfg["update_every"] = args.update_every
 
     ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_csv = results_dir / f"yelp_content_incremental_{ts}.csv"
-    out_png = results_dir / f"yelp_content_incremental_{ts}.png"
+    prefix  = args.dataset.replace("-", "")
+    out_csv = results_dir / f"{prefix}_content_incremental_{ts}.csv"
+    out_png = results_dir / f"{prefix}_content_incremental_{ts}.png"
 
     if args.csv:
         df = pd.read_csv(args.csv)
