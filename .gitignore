@@ -31,3 +31,6 @@ log_tensorboard/
 # Superseded results from before the results/ directory reorg — kept locally
 # for reference, not tracked going forward
 results/old/
+
+# content-init indices: large (286MB) and auto-regenerated from the checkpoint
+saved/compatible/*.pkl

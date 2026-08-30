@@ -1,2 +1,2 @@
-training_emissions_mg,streaming_emissions_mg,content_build_emissions_mg
-1800197.1478978004,156909.13237729087,585.7882312489678
+training_emissions_mg,streaming_emissions_mg,content_build_emissions_mg,total_update_emissions_mg,n_updates,avg_emissions_per_update_mg,total_seed_emissions_mg
+1800197.1478978004,156909.1323772909,585.7882312489678,15357.25462345727,26,590.6636393637411,15906.758030216593
