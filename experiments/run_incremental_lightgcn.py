@@ -75,6 +75,19 @@ DATASET_CONFIGS = {
     # Identical to "yelp" except that the realtime stream is ordered by timestamp
     # instead of by user. Same historical split, same checkpoint — only the order
     # in which the stream is consumed differs, so results are directly comparable.
+    # Global time cut instead of a per-user 80/20 split: everything on or before
+    # 2018-05-22 trains, everything after streams. No training interaction
+    # post-dates any streamed one, so the stream can be read chronologically
+    # without the model having seen the future. Requires its own checkpoint —
+    # the historical set differs from "yelp".
+    "yelp-timecut": {
+        "dataset":          "yelp-historical-timecut",
+        "historical_path":  "dataset/yelp-historical-timecut/yelp-historical-timecut.inter",
+        "realtime_path":    "dataset/yelp-realtime-timecut/yelp-realtime-timecut.inter",
+        "config_files":     ["configs/yelp_dataset.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":       "saved/compatible/LightGCN-yelp-historical-timecut.pth",
+        "id_cast":          lambda x: str(x),
+    },
     "yelp-timeorder": {
         "dataset":          "yelp-historical",
         "historical_path":  "dataset/yelp-historical/yelp-historical.inter",
@@ -480,7 +493,7 @@ STRATEGIES = ["no_update", "incremental", "full_retrain"]
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder"], required=True,
+    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder", "yelp-timecut"], required=True,
                         help="Dataset to run the experiment on")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                         help="Directory to save results (default: results/)")

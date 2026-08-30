@@ -392,7 +392,7 @@ def merge_no_update_overall(df: pd.DataFrame, no_update_csv: Path) -> pd.DataFra
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder"], default="yelp",
+    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder", "yelp-timecut"], default="yelp",
                         help="Only yelp supported (requires yelp.item metadata)")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Existing results CSV — skip streaming, just re-plot")

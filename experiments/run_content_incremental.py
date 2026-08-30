@@ -419,7 +419,7 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder"], default="yelp",
+    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder", "yelp-timecut"], default="yelp",
                         help="Only yelp supported (requires yelp.item metadata)")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Existing results CSV — skip streaming, just re-plot")

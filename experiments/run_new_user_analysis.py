@@ -204,7 +204,7 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder"], required=True)
+    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder", "yelp-timecut"], required=True)
     parser.add_argument("--csv", type=Path, default=None,
                         help="Existing results CSV — skip streaming, just re-plot")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
