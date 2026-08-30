@@ -1,0 +1,23 @@
+# Dataset config used ONLY by tools/split_dataset_timecut.py, not for training.
+#
+# Identical to yelp_dataset.yaml except that users are kept from 3 interactions
+# rather than 10. The looser threshold means users with 3-9 interactions survive
+# into the split, so they appear in the realtime stream. Training then loads the
+# historical file with yelp_dataset.yaml, whose "[10, inf)" filter excludes them
+# from the model — which is what makes them cold-start users at streaming time.
+#
+# With "[10, inf)" applied at split time those users were dropped from both
+# portions, leaving almost no unseen users in the stream (7.3%).
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+RATING_FIELD: rating
+TIME_FIELD: timestamp
+
+load_col:
+  inter: [user_id, item_id, rating, timestamp]
+
+val_interval:
+  rating: "[3, inf)"
+
+user_inter_num_interval: "[10, inf)"
+item_inter_num_interval: "[10, inf)"
