@@ -144,7 +144,9 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
     # ml-1m keys on genre + release decade; yelp on geohash + categories. The
     # schema goes in the cache name so the two never collide and an existing
     # yelp index stays valid.
-    schema     = "ml-1m" if args.dataset.startswith("ml-1m") else "yelp"
+    # cfg["dataset"] is the RecBole dataset name, e.g. "ml-1m-historical-timecut"
+    # or "yelp-historical-timecut" — available here, unlike argparse's args.
+    schema     = "ml-1m" if cfg["dataset"].startswith("ml-1m") else "yelp"
     cache_path = ckpt_path.with_name(
         f"{ckpt_path.stem}-content_init-{schema}-geo{geo_precision}.pkl")
 
