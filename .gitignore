@@ -34,3 +34,6 @@ results/old/
 
 # content-init indices: large (286MB) and auto-regenerated from the checkpoint
 saved/compatible/*.pkl
+
+# RecBole checkpoints: >100MB, exceeds GitHub limit
+saved/*.pth
