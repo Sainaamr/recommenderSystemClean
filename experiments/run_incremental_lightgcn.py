@@ -75,6 +75,17 @@ DATASET_CONFIGS = {
     # Identical to "yelp" except that the realtime stream is ordered by timestamp
     # instead of by user. Same historical split, same checkpoint — only the order
     # in which the stream is consumed differs, so results are directly comparable.
+    # Global time cut for MovieLens: everything on or before 2000-12-02 trains,
+    # everything after streams. Unlike the per-user split, where only 12 new users
+    # appear in the whole run, this leaves ~36% of each batch's users untrained.
+    "ml-1m-timecut": {
+        "dataset":          "ml-1m-historical-timecut",
+        "historical_path":  "dataset/ml-1m-historical-timecut/ml-1m-historical-timecut.inter",
+        "realtime_path":    "dataset/ml-1m-realtime-timecut/ml-1m-realtime-timecut.inter",
+        "config_files":     ["configs/dataset.yaml", "configs/historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":       "saved/compatible/LightGCN-ml1m-historical-timecut.pth",
+        "id_cast":          lambda x: str(int(x)),
+    },
     # Global time cut instead of a per-user 80/20 split: everything on or before
     # 2018-05-22 trains, everything after streams. No training interaction
     # post-dates any streamed one, so the stream can be read chronologically
@@ -493,7 +504,7 @@ STRATEGIES = ["no_update", "incremental", "full_retrain"]
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder", "yelp-timecut"], required=True,
+    parser.add_argument("--dataset", choices=["ml-1m", "yelp", "yelp-timeorder", "yelp-timecut", "ml-1m-timecut"], required=True,
                         help="Dataset to run the experiment on")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
                         help="Directory to save results (default: results/)")

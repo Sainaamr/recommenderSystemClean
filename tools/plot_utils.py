@@ -56,9 +56,17 @@ def _center_suptitle_over_axes(fig, ax, title: str, fontsize: int = 13):
     fig.suptitle(title, fontsize=fontsize, x=(pos.x0 + pos.x1) / 2)
 
 
-def _add_end_xtick(ax, max_x: int):
-    """Forces max_x to be a labeled tick so the last data point is readable."""
+def _add_end_xtick(ax, max_x: int, min_gap_frac: float = 0.04):
+    """
+    Forces max_x to be a labeled tick so the last data point is readable.
+
+    Any automatic tick closer than min_gap_frac of the axis range is dropped
+    first: without this, a run ending at e.g. 504,000 prints "500000" and
+    "504000" on top of each other.
+    """
     filtered = [t for t in ax.get_xticks() if 0 <= t <= max_x]
+    min_gap = max_x * min_gap_frac
+    filtered = [t for t in filtered if max_x - t > min_gap]
     ax.set_xticks(sorted(set(filtered + [max_x])))
 
 
