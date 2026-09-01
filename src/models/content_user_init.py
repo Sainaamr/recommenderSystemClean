@@ -6,9 +6,19 @@ items they interacted with to find geographically and categorically
 similar trained users, then returns a weighted average of their frozen
 LightGCN embeddings as the new user's cold-start embedding.
 
-Location is the primary signal (alpha=0.7), categories are secondary.
-Geographic sections use geohash encoding at 4-character precision (~39km x
-19.5km cells).
+Two schemas are supported, both reduced to the same shape: each item yields a
+PRIMARY set and a SECONDARY set of content tokens, and users are compared by
+histogram intersection over each, combined as alpha*primary + (1-alpha)*secondary.
+
+  yelp   — primary: geohash cell (4 chars, ~39km x 19.5km); secondary: categories.
+           Location dominates because a user in Phoenix cannot visit a Las Vegas
+           business at all.
+
+  ml-1m  — primary: genre; secondary: release decade. The roles are swapped
+           relative to yelp because year barely discriminates: 63% of ml-1m films
+           are 1990 or later and 59% fall in the 1990s alone, so a decade profile
+           is near-identical for every user, while the 18 genres (1.65 per film)
+           separate users cleanly.
 
 Standalone — does not modify any existing model or experiment file.
 """
@@ -29,6 +39,36 @@ def _geo_bin(lat: float, lon: float, precision: int = 4):
 """
 clean up the raw category of an item and turn it into a clean set
 """
+def _tok(v) -> str:
+    """
+    Canonical token string for an ID cell.
+
+    DataFrame.iterrows() upcasts a whole row to a single dtype, so on a file whose
+    rating/timestamp columns are float64 an int64 user_id comes back as 1.0 and
+    str() yields "1.0", which never matches RecBole's "1". Yelp is unaffected
+    (its tokens are strings, so rows stay object dtype), which is why this only
+    shows up on numeric-ID datasets like ml-1m.
+    """
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _parse_genres(genre_str) -> set:
+    """ml-1m genre:token_seq is space-separated, e.g. "Animation Children's Comedy"."""
+    if not genre_str or pd.isna(genre_str):
+        return set()
+    return {g.strip() for g in str(genre_str).split() if g.strip()}
+
+
+def _decade(year) -> set:
+    """Release decade as a one-element set, so it slots into the same machinery."""
+    try:
+        return {str(int(year) // 10 * 10)}
+    except (ValueError, TypeError):
+        return set()
+
+
 def _parse_categories(cat_str) -> set:
     if not cat_str or pd.isna(cat_str):
         return set()
@@ -44,7 +84,9 @@ class ContentUserInitializer:
     """
 
     def __init__(self, alpha: float = 0.7, top_k: int = 20,
-                 geo_precision: int = 4):
+                 geo_precision: int = 4, schema: str = "yelp"):
+        assert schema in ("yelp", "ml-1m"), f"unknown content schema {schema!r}"
+        self.schema = schema
         self.alpha         = alpha # ensures locations is more significant than catalogue
         self.top_k         = top_k # how many of the most similar trained users to average together
         self.geo_precision = geo_precision # geohash string length
@@ -76,9 +118,9 @@ class ContentUserInitializer:
         # for every historical row if it was excluded due to interaction limit
         # item will be added to excluded_user_items either by id or raw token
         for _, row in df_hist.iterrows():
-            token = str(row["user_id:token"])
+            token = _tok(row["user_id:token"])
             uid = user2id.get(token)
-            item_token = str(row["item_id:token"])
+            item_token = _tok(row["item_id:token"])
             iid = item2id.get(item_token)
 
             if uid is None:
@@ -100,17 +142,21 @@ class ContentUserInitializer:
         # excluded items referenced by an excluded user's dropped interaction
         df_item = pd.read_csv(item_meta_path, sep="\t", low_memory=False)
         for _, row in df_item.iterrows():
-            token = str(row["item_id:token"])
+            token = _tok(row["item_id:token"])
             iid = item2id.get(token)
             if iid is None and token not in needed_excluded_tokens:
                 continue
-            try:
-                geo = _geo_bin(float(row["latitude:float"]),
-                               float(row["longitude:float"]),
-                               self.geo_precision)
-            except (ValueError, TypeError):
-                geo = None
-            cats = _parse_categories(row.get("categories:token_seq", ""))
+            if self.schema == "ml-1m":
+                geo  = _parse_genres(row.get("genre:token_seq", ""))
+                cats = _decade(row.get("release_year:token"))
+            else:
+                try:
+                    geo = {_geo_bin(float(row["latitude:float"]),
+                                    float(row["longitude:float"]),
+                                    self.geo_precision)}
+                except (ValueError, TypeError):
+                    geo = set()
+                cats = _parse_categories(row.get("categories:token_seq", ""))
             if iid is None:
                 self._item_geo_by_token[token]  = geo
                 self._item_cats_by_token[token] = cats
@@ -124,8 +170,7 @@ class ContentUserInitializer:
         user_geo_freq: dict = {}
         user_cat_freq: dict = {}
         for uid, iid in trained_pairs:
-            geo = self._item_geo.get(iid)
-            if geo:
+            for geo in self._item_geo.get(iid, set()):
                 geo_counts = user_geo_freq.setdefault(uid, {})
                 geo_counts[geo] = geo_counts.get(geo, 0) + 1
             for cat in self._item_cats.get(iid, set()):
@@ -210,13 +255,13 @@ class ContentUserInitializer:
         for item_key in iids:
             if isinstance(item_key, str):
 
-                geo  = self._item_geo_by_token.get(item_key)
+                geo  = self._item_geo_by_token.get(item_key, set())
                 cats = self._item_cats_by_token.get(item_key, set())
             else:
-                geo  = self._item_geo.get(item_key)
+                geo  = self._item_geo.get(item_key, set())
                 cats = self._item_cats.get(item_key, set())
-            if geo:
-                new_geos[geo] = new_geos.get(geo, 0) + 1
+            for g in geo:
+                new_geos[g] = new_geos.get(g, 0) + 1
             for cat in cats:
                 new_cats[cat] = new_cats.get(cat, 0) + 1
 

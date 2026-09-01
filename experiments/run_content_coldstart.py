@@ -12,9 +12,13 @@ LightGCN is never retrained.
 
 Usage:
   python experiments/run_content_coldstart.py --dataset yelp
+  python experiments/run_content_coldstart.py --dataset ml-1m-timecut
   python experiments/run_content_coldstart.py --dataset yelp --csv results/existing.csv
 
-Note: only works meaningfully for yelp (requires yelp.item metadata).
+Note: requires item metadata. yelp uses geohash cells (primary) and business
+categories (secondary); ml-1m uses genre (primary) and release decade
+(secondary). The roles are swapped because release year barely separates
+users — 59% of ml-1m films are from the 1990s.
 """
 
 import os, sys, argparse, torch
@@ -41,7 +45,8 @@ from experiments.run_incremental_lightgcn import (
 )
 from tools.plot_utils import plot_content_vs_no_update, _CONTENT_COLDSTART_METRICS
 
-ITEM_META_PATH = "dataset/yelp/yelp.item"
+ITEM_META_PATHS = {"yelp": "dataset/yelp/yelp.item",
+                   "ml-1m": "dataset/ml-1m/ml-1m.item"}
 
 
 # Per-batch scoring
@@ -136,7 +141,12 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
 
     geo_precision = 4
     ckpt_path = Path(cfg["checkpoint"])
-    cache_path = ckpt_path.with_name(f"{ckpt_path.stem}-content_init-geo{geo_precision}.pkl")
+    # ml-1m keys on genre + release decade; yelp on geohash + categories. The
+    # schema goes in the cache name so the two never collide and an existing
+    # yelp index stays valid.
+    schema     = "ml-1m" if args.dataset.startswith("ml-1m") else "yelp"
+    cache_path = ckpt_path.with_name(
+        f"{ckpt_path.stem}-content_init-{schema}-geo{geo_precision}.pkl")
 
     if cache_path.exists():
         print(f"Found existing content-index cache: {cache_path}")
@@ -145,9 +155,11 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
         content_build_emissions_mg = 0.0
     else:
         tracker.start_task("content_build")
-        content_init = ContentUserInitializer(alpha=0.7, top_k=20, geo_precision=geo_precision)
+        content_init = ContentUserInitializer(alpha=0.7, top_k=20,
+                                              geo_precision=geo_precision,
+                                              schema=schema)
         content_init.build(
-            item_meta_path        = ITEM_META_PATH,
+            item_meta_path        = ITEM_META_PATHS[schema],
             historical_inter_path = cfg["historical_path"],
             user2id               = user2id,
             item2id               = item2id,
@@ -392,8 +404,8 @@ def merge_no_update_overall(df: pd.DataFrame, no_update_csv: Path) -> pd.DataFra
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder", "yelp-timecut"], default="yelp",
-                        help="Only yelp supported (requires yelp.item metadata)")
+    parser.add_argument("--dataset", choices=["yelp", "yelp-timeorder", "yelp-timecut", "ml-1m-timecut"], default="yelp",
+                        help="Content schema is chosen from the dataset: geohash+category for yelp, genre+decade for ml-1m")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Existing results CSV — skip streaming, just re-plot")
     parser.add_argument("--new-user-csv", type=Path, default=None,
