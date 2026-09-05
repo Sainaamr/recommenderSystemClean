@@ -272,6 +272,32 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
     # Deep copy history so strategies don't interfere with each other
     history = {uid: set(items) for uid, items in user_history.items()}
 
+    # Growing ID mappings — new users/items get assigned the next available ID
+    # instead of being dropped, and are mean-initialised by expand_embeddings.
+    # Shared by every strategy so all of them are scored on the same
+    # interactions: dropping unseen IDs for full_retrain only made its metrics
+    # incomparable (on yelp-timecut 41% of stream users are untrained, so it
+    # was being graded on a smaller, easier slice of each batch).
+    # user2id/item2id are mutated in place, and rebound after each full retrain
+    # — the closures read them at call time, so they follow the rebinding; the
+    # counters are reset explicitly in the retrain block.
+    next_user_id = [model.n_users]   # list so it's mutable inside the closure
+    next_item_id = [model.n_items]
+
+    def get_or_create_uid(x):
+        key = id_cast(x)
+        if key not in user2id:
+            user2id[key] = next_user_id[0]
+            next_user_id[0] += 1
+        return user2id[key]
+
+    def get_or_create_iid(x):
+        key = id_cast(x)
+        if key not in item2id:
+            item2id[key] = next_item_id[0]
+            next_item_id[0] += 1
+        return item2id[key]
+
     if strategy == "full_retrain":
         # both paths are pre-filtered to rating>=3 by tools/split_dataset.py
         realtime_df    = pd.read_csv(cfg["realtime_path"], sep="\t")
@@ -303,28 +329,6 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         # realtime_path is pre-filtered to rating>=3 by tools/split_dataset.py
         df = pd.read_csv(cfg["realtime_path"], sep="\t")
 
-        # Growing ID mappings — new users/items get assigned the next available ID
-        # instead of being dropped. user2id and item2id are mutated in place.
-        # this is different compare to the full retrain
-        next_user_id = [model.n_users]   # list so it's mutable inside lambda
-        next_item_id = [model.n_items]
-
-        # based on user id return the row number of the original one or give me row if new user
-        # each row represent a user
-        def get_or_create_uid(x):
-            key = id_cast(x)
-            if key not in user2id:
-                user2id[key] = next_user_id[0]
-                next_user_id[0] += 1
-            return user2id[key]
-
-        def get_or_create_iid(x):
-            key = id_cast(x)
-            if key not in item2id:
-                item2id[key] = next_item_id[0]
-                next_item_id[0] += 1
-            return item2id[key]
-
         n_batches = len(df) // batch_size
 
         # Buffer to accumulate new interactions since last update
@@ -341,35 +345,25 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
         batch = df.iloc[i * batch_size: (i + 1) * batch_size].copy()
 
-        if strategy == "full_retrain":
-            batch_users, batch_items = [], []
-            for _, row in batch.iterrows():
-                u  = user2id.get(id_cast(row["user_id:token"]))
-                it = item2id.get(id_cast(row["item_id:token"]))
-                if u is not None and it is not None and u < model.n_users and it < model.n_items:
-                    batch_users.append(u)
-                    batch_items.append(it)
-        else:
-            # per-batch ID resolution
-            batch["uid"] = batch["user_id:token"].apply(get_or_create_uid).astype(int)
-            batch["iid"] = batch["item_id:token"].apply(get_or_create_iid).astype(int)
-            batch_users = batch["uid"].tolist()
-            batch_items = batch["iid"].tolist()
+        # per-batch ID resolution — same for every strategy
+        batch["uid"] = batch["user_id:token"].apply(get_or_create_uid).astype(int)
+        batch["iid"] = batch["item_id:token"].apply(get_or_create_iid).astype(int)
+        batch_users = batch["uid"].tolist()
+        batch_items = batch["iid"].tolist()
 
         id_resolution_emissions_mg = task_mg(tracker.stop_task())
 
         tracker.start_task(f"batch_{i}_expand_embeddings")
 
-        if strategy != "full_retrain":
-            # expansion — only grow the table if THIS batch actually
-            # introduced a uid/iid beyond the model's current size
-            max_u = max(batch_users, default=0)
-            max_i = max(batch_items, default=0)
-            if max_u >= model.n_users or max_i >= model.n_items:
-                model.expand_embeddings(
-                    max(max_u + 1, model.n_users),
-                    max(max_i + 1, model.n_items),
-                )
+        # expansion — only grow the table if THIS batch actually
+        # introduced a uid/iid beyond the model's current size
+        max_u = max(batch_users, default=0)
+        max_i = max(batch_items, default=0)
+        if max_u >= model.n_users or max_i >= model.n_items:
+            model.expand_embeddings(
+                max(max_u + 1, model.n_users),
+                max(max_i + 1, model.n_items),
+            )
 
         expand_embeddings_emissions_mg = task_mg(tracker.stop_task())
 
@@ -462,6 +456,12 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             user2id, item2id, config, dataset = load_id_mappings(combined_cfg)
             model = IncrementalLightGCN.from_checkpoint(ckpt_path, config, dataset)
             history = build_user_history(user2id, item2id, combined_cfg)
+
+            # Retraining renumbers every ID, so the growing-ID counters have to
+            # restart from the new model's sizes; otherwise the next unseen user
+            # would be assigned an index already in use.
+            next_user_id[0] = model.n_users
+            next_item_id[0] = model.n_items
 
             update_emissions_mg = task_mg(tracker.stop_task())
             batch_loop_emissions_mg += update_emissions_mg

@@ -17,6 +17,32 @@ COLORS = {
 }
 SMOOTH = 30   # rolling average window for recall lines
 DPI    = 150
+
+# Output format for every figure. PDF keeps the plots as vectors, so they stay
+# sharp at any zoom, embed into LaTeX without resampling, and are far smaller
+# than the 150-DPI rasters they replace. DPI still applies to any rasterized
+# element inside a vector figure.
+FIG_EXT = "pdf"
+
+
+def _base(out_path) -> str:
+    """
+    Caller-supplied output path minus its figure extension.
+
+    Call sites pass names ending in ".png" (historically the output format).
+    Stripping either extension here means those callers keep working unchanged
+    while the files written come out as FIG_EXT.
+    """
+    s = str(out_path)
+    for ext in (".png", ".pdf"):
+        if s.endswith(ext):
+            return s[: -len(ext)]
+    return s
+
+
+def _out(out_path) -> Path:
+    """Caller-supplied output path with its extension normalized to FIG_EXT."""
+    return Path(f"{_base(out_path)}.{FIG_EXT}")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Keyed by cost source (not strategy) — one bar can stack multiple sources.
@@ -229,12 +255,13 @@ def plot_emissions_stacked(strategy_csvs: dict, out_path: Path, title: str,
     _draw_emissions_bars(ax, labels, strategy_components, component_order,
                          training_emissions_mg=training_emissions_mg)
     plt.tight_layout()
+    out_path = _out(out_path)
     plt.savefig(out_path, dpi=DPI, bbox_inches="tight")  # fits the outside legend
     print(f"Plot saved → {out_path}")
     plt.close()
 
     if component_order:
-        ongoing_path = Path(str(out_path).replace(".png", "_ongoing_only.png"))
+        ongoing_path = Path(f"{_base(out_path)}_ongoing_only.{FIG_EXT}")
         fig, ax = plt.subplots(figsize=(max(6, 2.2 * len(labels)), 6))
         fig.suptitle(f"{title} (ongoing costs only, training excluded)", fontsize=13, wrap=True)
         _draw_emissions_bars(ax, labels, strategy_components, component_order,
@@ -291,6 +318,7 @@ def plot_energy_summary_stacked(summary: pd.DataFrame, out_path: Path, title: st
     _draw_emissions_bars(ax, labels, strategy_components, component_order,
                          training_emissions_mg=None, log_y=log_y)
     plt.tight_layout()
+    out_path = _out(out_path)
     plt.savefig(out_path, dpi=DPI, bbox_inches="tight")  # fits the outside legend
     print(f"Plot saved → {out_path}")
     plt.close()
@@ -308,14 +336,14 @@ def plot_streaming_results(df: pd.DataFrame, out_path: Path,
     _precision_at_10.png, _ndcg_at_10.png, _hr_at_10.png, _recall_at_20.png,
     _precision_at_20.png, _ndcg_at_20.png, _hr_at_20.png, _mrr.png
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
 
     available = [m for m in METRIC_LABELS if m in df.columns and (metrics is None or m in metrics)]
     for metric in available:
         fig, ax = plt.subplots(figsize=(12, 5))
         plot_metric_over_time(ax, df, metric=metric, subtitle=subtitle)
         _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -330,8 +358,15 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
     interaction range it covers. Called by plot_new_user_analysis.
 
     If df has "window_unique_users" (run_new_user_analysis.py only), the bar
-    is stacked: new users at the bottom, existing active users on top.
-    Without it, only the new-user bar is drawn.
+    is stacked: users arriving for the first time at the bottom, every other
+    active user on top. Without it, only the arrivals bar is drawn.
+
+    The top segment is "returning", not "existing": it is everyone active who
+    did not arrive in THIS window, which includes untrained users who arrived
+    in an earlier one (the model never retrains here, so they still hold a
+    mean-initialised embedding). On yelp-timecut that is ~2,987 of the ~8,336
+    users in the top segment, so calling it "existing" would imply the model
+    knows three thousand users it has never trained on.
 
     subtitle, if given, swaps title/subtitle roles: the descriptive text
     becomes the per-axes title instead of the suptitle.
@@ -357,12 +392,12 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
     # width=widths: windows are contiguous, so bars must touch with no gaps.
     ax.bar(x, grouped["n_new_users"], width=widths,
            color="#E69F00", alpha=0.4, edgecolor="#E69F00", linewidth=1.2,
-           label=f"New users per {update_every} batches")
+           label=f"New unique users per {update_every} batches")
     if has_existing:
         n_existing_active = grouped["window_unique_users"] - grouped["n_new_users"]
         ax.bar(x, n_existing_active, width=widths, bottom=grouped["n_new_users"],
               color="#0072B2", alpha=0.4, edgecolor="#0072B2", linewidth=1.2,
-              label="Existing active users")
+              label="Returning active users")
         ax.set_ylabel("Unique active users")
         top_values = grouped["window_unique_users"]
     else:
@@ -370,7 +405,7 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
         top_values = grouped["n_new_users"]
     ax.set_xlabel("Interactions seen")
     descriptive_title = ("Active Users per Update Window" if has_existing
-                         else "New User Arrivals per Update Window")
+                         else "New Unique User Arrivals per Update Window")
     max_x = int(df["interactions"].max())
     ax.set_xlim(left=0, right=max_x)
     y_min, y_max = top_values.min(), top_values.max()
@@ -386,7 +421,7 @@ def _plot_new_user_arrivals(df: pd.DataFrame, base: Path, title: str,
         ax.set_title(descriptive_title)
         _center_suptitle_over_axes(fig, ax, title)
 
-    arrivals_path = Path(f"{base}_new_user_arrivals.png")
+    arrivals_path = Path(f"{base}_new_user_arrivals.{FIG_EXT}")
     plt.savefig(arrivals_path, dpi=DPI)
     print(f"Plot saved → {arrivals_path}")
     plt.close()
@@ -397,9 +432,17 @@ def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
                              subtitle: str = None):
     """
     Interaction-volume counterpart to _plot_new_user_arrivals — same stacked
-    layout but counts raw interactions via "n_new_user_interactions"
-    (run_new_user_analysis.py only), which unlike a person-count is always
-    safe to sum across a window.
+    layout, and on the same ARRIVALS basis: interactions belonging to users
+    who appeared for the first time in this window, via
+    "n_first_time_new_user_interactions" (run_new_user_analysis.py only).
+    Unlike a person-count, an event count is always safe to sum.
+
+    It must not use "n_new_user_interactions": that counts events from every
+    untrained user however long ago they arrived, so pairing it with the
+    arrivals bar chart beside it compares two different populations. On
+    yelp-timecut the two differ by 5.6x (8,744 vs 1,560 per window) and even
+    trend in opposite directions — untrained users accumulate over the
+    stream, while arrivals decline.
 
     subtitle, if given, swaps title/subtitle roles, same as in
     _plot_new_user_arrivals.
@@ -409,7 +452,7 @@ def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
     grouped = (
         df.assign(chunk=(df["batch"] - 1) // update_every)
           .groupby("chunk")
-          .agg(n_new_user_interactions=("n_new_user_interactions", "sum"),
+          .agg(n_new_user_interactions=("n_first_time_new_user_interactions", "sum"),
                interactions=("interactions", "max"),
                n_batches=("batch", "count"))
     )
@@ -420,10 +463,10 @@ def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.bar(x, grouped["n_new_user_interactions"], width=widths,
           color="#E69F00", alpha=0.4, edgecolor="#E69F00", linewidth=1.2,
-          label=f"New-user interactions per {update_every} batches")
+          label=f"New unique user interactions per {update_every} batches")
     ax.bar(x, n_existing_interactions, width=widths, bottom=grouped["n_new_user_interactions"],
           color="#0072B2", alpha=0.4, edgecolor="#0072B2", linewidth=1.2,
-          label="Existing-user interactions")
+          label="Returning-user interactions")
     ax.set_ylabel("Interactions")
     ax.set_xlabel("Interactions seen")
     max_x = int(df["interactions"].max())
@@ -438,7 +481,7 @@ def _plot_interaction_volume(df: pd.DataFrame, base: Path, title: str,
         ax.set_title("Interaction Volume per Update Window")
         _center_suptitle_over_axes(fig, ax, title)
 
-    path = Path(f"{base}_interaction_volume.png")
+    path = Path(f"{base}_interaction_volume.{FIG_EXT}")
     plt.savefig(path, dpi=DPI)
     print(f"Plot saved → {path}")
     plt.close()
@@ -455,7 +498,7 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
     Outputs (results/recent/): yelp_new_user_analysis_20260809_190658_replot_recall.png,
     _precision.png, _ndcg.png, _new_user_arrivals.png, _interaction_volume.png
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     x = df["interactions"]
 
     def smoothed(col):
@@ -497,14 +540,14 @@ def plot_new_user_analysis(df: pd.DataFrame, out_path: Path, title: str,
         ax.legend(loc="upper left")
         _center_suptitle_over_axes(fig, ax, title)
 
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
 
     _plot_new_user_arrivals(df, base, title, batch_size=batch_size, update_every=update_every,
                             subtitle=subtitle)
-    if "n_new_user_interactions" in df.columns:
+    if "n_first_time_new_user_interactions" in df.columns:
         _plot_interaction_volume(df, base, title, batch_size=batch_size, update_every=update_every,
                                  subtitle=subtitle)
 
@@ -527,7 +570,7 @@ def plot_content_incremental_groups(df: pd.DataFrame, out_path: Path, title: str
     Outputs (results/): yelp_content_incremental_20260810_211929_replot_recall.png,
     _precision.png, _ndcg.png
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     x = df["interactions"]
 
     def smoothed(col):
@@ -566,7 +609,7 @@ def plot_content_incremental_groups(df: pd.DataFrame, out_path: Path, title: str
         ax.legend(loc="upper left")
         _center_suptitle_over_axes(fig, ax, title)
 
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -592,7 +635,7 @@ def plot_content_vs_no_update(df: pd.DataFrame, out_path: Path, title: str,
     Also called from run_content_incremental.py (results/): yelp_no_update_vs_content_incremental_recall.png,
     _precision.png, _ndcg.png (only the vs_no_update_overall family, since that CSV has no *_new_mean column).
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     x = df["interactions"]
 
     def smoothed(col):
@@ -638,7 +681,7 @@ def plot_content_vs_no_update(df: pd.DataFrame, out_path: Path, title: str,
             else:
                 ax.set_title(chart_title)
                 _center_suptitle_over_axes(fig, ax, title)
-            path = Path(f"{base}_vs_no_update_overall_{metric}.png")
+            path = Path(f"{base}_vs_no_update_overall_{metric}.{FIG_EXT}")
             plt.savefig(path, dpi=DPI)
             print(f"Plot saved → {path}")
             plt.close()
@@ -671,7 +714,7 @@ def plot_content_vs_no_update(df: pd.DataFrame, out_path: Path, title: str,
             else:
                 ax.set_title(chart_title)
                 _center_suptitle_over_axes(fig, ax, title)
-            path = Path(f"{base}_vs_no_update_groups_{metric}.png")
+            path = Path(f"{base}_vs_no_update_groups_{metric}.{FIG_EXT}")
             plt.savefig(path, dpi=DPI)
             print(f"Plot saved → {path}")
             plt.close()
@@ -692,7 +735,7 @@ def plot_content_init_vs_content_incremental(df_content_init: pd.DataFrame, df_c
     Outputs (results/): yelp_content_init_vs_content_incremental_{metric}.png per metric.
     """
     df = pd.merge(df_content_init, df_content_incremental, on="batch", suffixes=("_ci", "_cinc"))
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     x = df["interactions_ci"]
 
     def smoothed(col):
@@ -739,7 +782,7 @@ def plot_content_init_vs_content_incremental(df_content_init: pd.DataFrame, df_c
         else:
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -747,17 +790,21 @@ def plot_content_init_vs_content_incremental(df_content_init: pd.DataFrame, df_c
 
 def plot_all_strategies_comparison(df_no_update: pd.DataFrame, df_incremental: pd.DataFrame,
                                    df_content_coldstart: pd.DataFrame, df_content_incremental: pd.DataFrame,
-                                   out_path: Path, title: str, subtitle: str = None, smooth: int = 20):
+                                   out_path: Path, title: str, subtitle: str = None, smooth: int = 20,
+                                   df_full_retrain: pd.DataFrame = None):
     """
     Overall recall/precision/ndcg@10 for no_update/incremental/
     content_coldstart/content_incremental on one set of axes, smoothed lines
     only. Update-trigger batches — verified identical between incremental
     and content_incremental — are marked with one shared set of dashed lines.
 
+    df_full_retrain, if given, adds a fifth line from its "{metric}_at_10"
+    columns (run_incremental_lightgcn.py full_retrain output).
+
     Outputs (results/): yelp_strategy_comparison_recall.png, _precision.png, _ndcg.png
     (ad hoc — not wired into any script, run manually when needed).
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     max_x = int(df_no_update["interactions"].max())
 
     def smoothed(df, col):
@@ -775,6 +822,9 @@ def plot_all_strategies_comparison(df_no_update: pd.DataFrame, df_incremental: p
             (df_content_coldstart,   f"{metric}_overall_content","#56B4E9",             "Content-init",  1.0),
             (df_content_incremental, f"{metric}_overall_content", COLORS["incremental"], "Content incremental", 1.0),
         ]
+        if df_full_retrain is not None:
+            series.append(
+                (df_full_retrain, f"{metric}_at_10", "#7B3294", "Full retrain", 1.0))
         for df_s, col, color, label, line_alpha in series:
             ax.plot(df_s["interactions"], smoothed(df_s, col), color=color, linewidth=2,
                    label=label, alpha=line_alpha)
@@ -801,7 +851,7 @@ def plot_all_strategies_comparison(df_no_update: pd.DataFrame, df_incremental: p
         else:
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -834,7 +884,7 @@ def plot_content_incremental_frequency_comparison(runs: dict, out_path: Path, ti
 
     Outputs: <out_path>_{metric}.png per metric.
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     labels = list(runs.keys())
     colors = _frequency_comparison_colors(len(labels))
     max_x = int(max(df["interactions"].max() for df in runs.values()))
@@ -867,7 +917,7 @@ def plot_content_incremental_frequency_comparison(runs: dict, out_path: Path, ti
         else:
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -946,7 +996,7 @@ def plot_content_incremental_frequency_summary(csv_dir: Path, out_path: Path, ti
         else:
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{str(out_path).replace('.png', '')}_{metric}.png")
+        path = Path(f"{_base(out_path)}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -1098,7 +1148,7 @@ def plot_content_incremental_quality_vs_energy(csv_dir: Path, out_path: Path, ti
         else:
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{str(out_path).replace('.png', '')}_{metric}.png")
+        path = Path(f"{_base(out_path)}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()
@@ -1118,7 +1168,7 @@ def plot_no_update_incremental_full_retrain(df_no_update: pd.DataFrame, df_incre
 
     Outputs (results/): ml1m_no_update_vs_incremental_vs_full_retrain_{metric}.png per metric.
     """
-    base = Path(str(out_path).replace(".png", ""))
+    base = Path(_base(out_path))
     max_x = int(df_no_update["interactions"].max())
 
     def smoothed(df, col):
@@ -1176,7 +1226,7 @@ def plot_no_update_incremental_full_retrain(df_no_update: pd.DataFrame, df_incre
         else:
             ax.set_title(chart_title)
             _center_suptitle_over_axes(fig, ax, title)
-        path = Path(f"{base}_{metric}.png")
+        path = Path(f"{base}_{metric}.{FIG_EXT}")
         plt.savefig(path, dpi=DPI)
         print(f"Plot saved → {path}")
         plt.close()

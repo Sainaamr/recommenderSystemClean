@@ -37,3 +37,8 @@ saved/compatible/*.pkl
 
 # RecBole checkpoints: >100MB, exceeds GitHub limit
 saved/*.pth
+
+# 103 MB — over GitHub's 100 MB per-file limit (the other compatible
+# checkpoints are 95 MB and 8 MB, so they stay tracked). Lives on the server;
+# regenerate locally with run_incremental_lightgcn.py --dataset yelp-timecut.
+/saved/compatible/LightGCN-yelp-historical-timecut.pth

@@ -1,0 +1,26 @@
+\begin{tabular}{lllll}
+\toprule
+section & no_update & incremental & content_coldstart & content_incremental \\
+\midrule
+training_emissions_mg & 1,832,436 & 1,832,436 & 1,832,436 & 1,832,436 \\
+id_mapping_emissions_mg & 140 & 136 & 133 & 151 \\
+checkpoint_load_emissions_mg & 146 & 137 & 134 & 139 \\
+build_user_history_emissions_mg & 52 & 50 & 51 & 51 \\
+embedding_snapshot_emissions_mg & -- & -- & 17 & 18 \\
+content_build_emissions_mg & -- & -- & 619 & 0 \\
+id_resolution_emissions_mg & 5,912 & 5,918 & 5,914 & 5,914 \\
+recovered_history_seed_emissions_mg & -- & -- & 8,661 & 8,625 \\
+expand_embeddings_emissions_mg & 67,337 & 79,836 & 71,180 & 81,586 \\
+gt_split_emissions_mg & -- & -- & 5,896 & 5,884 \\
+scoring_emissions_mg & 9,963 & 10,954 & 7,691 & 7,664 \\
+update_prep_emissions_mg & 5,875 & 5,877 & -- & -- \\
+history_update_emissions_mg & 5,882 & 5,881 & 5,888 & 5,887 \\
+apply_content_seeds_emissions_mg & -- & -- & 6,238 & 6,304 \\
+batch_total_emissions_mg & 94,969 & 108,465 & 111,469 & 121,865 \\
+update_total_emissions_mg & 0 & 16,264 & 0 & 16,097 \\
+n_updates & 0 & 25 & 0 & 25 \\
+avg_emissions_per_update_mg & 0 & 651 & 0 & 644 \\
+streaming_emissions_mg & 95,306 & 125,053 & 112,422 & 138,321 \\
+grand_total_mg & 1,927,741 & 1,957,488 & 1,944,858 & 1,970,757 \\
+\bottomrule
+\end{tabular}

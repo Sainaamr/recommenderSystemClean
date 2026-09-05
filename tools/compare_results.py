@@ -510,14 +510,29 @@ def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 10
     tools/plot_utils._plot_new_user_arrivals/_plot_interaction_volume),
     averaged across all windows. Two rows, one per counting unit:
 
-      "users"        — people-counts per window, via window_unique_users
+      "users"        — people-counts per window: n_new_users (users seen
+                        for the first time in this window; first
+                        appearances are disjoint across batches, so
+                        summing them is correct) over window_unique_users
                         (a running, cross-batch-deduplicated count reset
                         every update_every batches — summing the per-batch
                         n_unique_users column instead would double-count
                         repeat visitors within a window).
       "interactions" — raw event counts per window, via
-                        n_new_user_interactions (always safe to sum, no
-                        dedup needed).
+                        n_first_time_new_user_interactions (always safe to
+                        sum, no dedup needed).
+
+    Both rows count the same population: users arriving for the first time.
+    Earlier versions took "users" from n_new_users (first appearances) but
+    "interactions" from n_new_user_interactions, which counts events from
+    every untrained user however long ago they arrived. Those two are not
+    comparable — on yelp-timecut a window holds 888 first appearances but
+    3,875 untrained users, so pairing them made new users look ~5.6x more
+    active per head than they are.
+
+    Use n_new_user_interactions / window_unique_untrained_users instead if
+    the question is cold-start coverage ("how much traffic has no trained
+    embedding") rather than arrivals ("how many people showed up").
 
     pct_new (both rows) is new/total per window, averaged — not computed
     from the mean_new/mean_total columns — matching how the CSV's own
@@ -527,7 +542,8 @@ def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 10
     yelp_new_user_windows_summary_20260809_190658.tex
     """
     df = pd.read_csv(csv)
-    required = ["n_new_users", "window_unique_users", "n_new_user_interactions"]
+    required = ["n_new_users", "window_unique_users",
+                "n_first_time_new_user_interactions"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"{csv} is missing column(s) {missing} — re-run "
@@ -538,7 +554,7 @@ def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 10
           .groupby("chunk")
           .agg(n_new_users=("n_new_users", "sum"),
                unique_users=("window_unique_users", "max"),
-               n_new_user_interactions=("n_new_user_interactions", "sum"),
+               n_new_user_interactions=("n_first_time_new_user_interactions", "sum"),
                n_batches=("batch", "count"))
     )
     grouped["total_interactions"] = grouped["n_batches"] * batch_size

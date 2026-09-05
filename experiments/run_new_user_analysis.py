@@ -115,6 +115,20 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
     # Tracks unique active uids since the last UPDATE_EVERY-batch window
     window_active_users = set()
 
+    # Same, restricted to untrained uids. Needed because "new user" is used in
+    # two different senses here and they must not be mixed in one comparison:
+    #
+    #   arrivals  — uids classified as new for the FIRST time in this batch
+    #               (n_new_users). Answers "how many people showed up".
+    #   untrained — every uid the model was never trained on, however long ago
+    #               they first appeared (n_untrained_users_active). This is the
+    #               population the recall_new_user metric scores, and the one
+    #               n_new_user_interactions counts interactions for.
+    #
+    # Pairing an arrivals count against an untrained interaction count
+    # understates activity-per-user by ~5.6x on yelp-timecut.
+    window_untrained_users = set()
+
     print(f"  Streaming {n_batches} batches (no retraining)...")
 
     for i in range(n_batches):
@@ -151,17 +165,31 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
         seen_as_new |= new_user_set
         n_new_users = len(first_time_new)
 
-        # Interaction-volume countt: every raw row in
-        # this batch whose uid is classified as new_user
+        # Interaction-volume count: every raw row in this batch whose uid is
+        # classified as new_user — i.e. the UNTRAINED population, not just the
+        # users arriving now. Matches what recall_new_user scores.
         n_new_user_interactions = sum(1 for uid in batch_users if uid >= n_users_trained)
+
+        # The arrivals-basis counterpart: interactions belonging only to users
+        # appearing for the first time in this batch. Pair this with
+        # n_new_users; pair n_new_user_interactions with
+        # n_untrained_users_active.
+        n_first_time_new_user_interactions = sum(1 for uid in batch_users if uid in first_time_new)
+
+        # All untrained users active in this batch, regardless of when they
+        # first appeared — the denominator that matches n_new_user_interactions.
+        n_untrained_users_active = len(new_user_set)
 
         n_unique_users = len(set(batch_users))
         pct_new_user = n_new_users / max(n_unique_users, 1)
+        pct_untrained_users = n_untrained_users_active / max(n_unique_users, 1)
 
-        # Running, deduplicated count of unique active users since the last
-        # window boundary 
+        # Running, deduplicated counts of unique active users since the last
+        # window boundary — all users, and the untrained subset.
         window_active_users.update(batch_users)
         window_unique_users = len(window_active_users)
+        window_untrained_users.update(new_user_set)
+        window_unique_untrained_users = len(window_untrained_users)
 
         for uid, iid in zip(batch_users, batch_items):
             history.setdefault(uid, set()).add(iid)
@@ -181,13 +209,18 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
             "pct_new_user":            pct_new_user,
             "n_new_users":             n_new_users,
             "n_new_user_interactions": n_new_user_interactions,
+            "n_first_time_new_user_interactions": n_first_time_new_user_interactions,
+            "n_untrained_users_active":          n_untrained_users_active,
+            "pct_untrained_users":               pct_untrained_users,
             "n_unique_users":          n_unique_users,
             "window_unique_users":     window_unique_users,
+            "window_unique_untrained_users": window_unique_untrained_users,
             "n_users_trained":         n_users_trained,
         })
 
         if (i + 1) % UPDATE_EVERY == 0:
             window_active_users = set()
+            window_untrained_users = set()
 
         if (i + 1) % 20 == 0:
             print(f"  Batch {i+1:>3}/{n_batches}  "
