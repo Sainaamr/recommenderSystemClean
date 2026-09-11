@@ -99,6 +99,22 @@ DATASET_CONFIGS = {
         "checkpoint":       "saved/compatible/LightGCN-yelp-historical-timecut.pth",
         "id_cast":          lambda x: str(x),
     },
+    # Same historical split and checkpoint as yelp-timecut — only the stream
+    # differs: no minimum-interaction filter, so late/light users survive
+    # instead of being right-censored out (see
+    # tools/split_dataset_timecut_unfiltered.py). Nothing needs retraining.
+    # Intended for run_new_user_analysis.py, to test whether new-user arrivals
+    # are actually constant once the filter is removed. Quality metrics on this
+    # stream are not comparable to the filtered runs: 63% of its users have a
+    # single interaction.
+    "yelp-timecut-unfiltered": {
+        "dataset":          "yelp-historical-timecut",
+        "historical_path":  "dataset/yelp-historical-timecut/yelp-historical-timecut.inter",
+        "realtime_path":    "dataset/yelp-realtime-timecut-unfiltered/yelp-realtime-timecut-unfiltered.inter",
+        "config_files":     ["configs/yelp_dataset.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
+        "checkpoint":       "saved/compatible/LightGCN-yelp-historical-timecut.pth",
+        "id_cast":          lambda x: str(x),
+    },
     "yelp-timeorder": {
         "dataset":          "yelp-historical",
         "historical_path":  "dataset/yelp-historical/yelp-historical.inter",

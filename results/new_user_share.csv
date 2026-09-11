@@ -1,0 +1,17 @@
+dataset,scope,stat,definition,unit,n_new,n_total,pct_new
+yelp-timecut,stream,count,untrained,users,23088.0,55989.0,41.23667148904249
+yelp-timecut,stream,count,untrained,interactions,227343.0,504000.0,45.1077380952381
+yelp-timecut,window,mean,first_appearance,users,888.0,9224.23076923077,9.304522746763027
+yelp-timecut,window,mean,untrained,users,3875.269230769231,9224.23076923077,42.07376817449312
+yelp-timecut,window,mean,first_appearance,interactions,1560.1923076923076,19384.615384615383,7.840192307692307
+yelp-timecut,window,mean,untrained,interactions,8743.961538461539,19384.615384615383,45.10903846153846
+yelp-timecut,per_user,median,untrained,interactions_in_first_batch,1.0,7.0,20.0
+yelp-timecut,per_user,count,untrained,users_never_returning,2696.0,23088.0,11.677061677061678
+ml-1m-timecut,stream,count,untrained,users,706.0,1779.0,39.685216413715565
+ml-1m-timecut,stream,count,untrained,interactions,85426.0,166000.0,51.46144578313253
+ml-1m-timecut,window,mean,first_appearance,users,78.44444444444444,463.22222222222223,21.750870727284607
+ml-1m-timecut,window,mean,untrained,users,134.55555555555554,463.22222222222223,32.69905724174436
+ml-1m-timecut,window,mean,first_appearance,interactions,5020.555555555556,18444.444444444445,25.584999999999997
+ml-1m-timecut,window,mean,untrained,interactions,9491.777777777777,18444.444444444445,49.14537037037037
+ml-1m-timecut,per_user,median,untrained,interactions_in_first_batch,41.5,70.5,97.9795918367347
+ml-1m-timecut,per_user,count,untrained,users_never_returning,340.0,706.0,48.1586402266289

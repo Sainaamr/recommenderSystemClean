@@ -1,0 +1,26 @@
+\begin{tabular}{lllll}
+\toprule
+section & no_update & incremental & content_coldstart & content_incremental \\
+\midrule
+training_emissions_mg & 188,839 & 188,839 & 188,839 & 188,839 \\
+id_mapping_emissions_mg & 44 & 40 & 41 & 41 \\
+checkpoint_load_emissions_mg & 59 & 63 & 57 & 56 \\
+build_user_history_emissions_mg & 20 & 20 & 20 & 20 \\
+embedding_snapshot_emissions_mg & -- & -- & 13 & 13 \\
+content_build_emissions_mg & -- & -- & 119 & 0 \\
+id_resolution_emissions_mg & 1,968 & 1,947 & 1,945 & 1,946 \\
+recovered_history_seed_emissions_mg & -- & -- & 1,936 & 1,936 \\
+expand_embeddings_emissions_mg & 8,935 & 8,747 & 8,139 & 9,015 \\
+gt_split_emissions_mg & -- & -- & 1,936 & 1,936 \\
+scoring_emissions_mg & 2,333 & 2,237 & 1,957 & 1,957 \\
+update_prep_emissions_mg & 1,965 & 1,936 & -- & -- \\
+history_update_emissions_mg & 1,963 & 1,936 & 1,938 & 1,938 \\
+apply_content_seeds_emissions_mg & -- & -- & 1,945 & 1,945 \\
+batch_total_emissions_mg & 17,164 & 16,803 & 19,795 & 20,674 \\
+update_total_emissions_mg & 0 & 1,728 & 0 & 1,814 \\
+n_updates & 0 & 8 & 0 & 8 \\
+avg_emissions_per_update_mg & 0 & 216 & 0 & 227 \\
+streaming_emissions_mg & 17,286 & 18,654 & 20,045 & 22,618 \\
+grand_total_mg & 206,126 & 207,494 & 208,884 & 211,458 \\
+\bottomrule
+\end{tabular}

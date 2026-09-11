@@ -14,6 +14,12 @@ the other overstates how much a "new user" interacts. This script reports
 each definition on its own terms, and adds the whole-stream totals, which
 the per-batch pipeline never writes out.
 
+It also reports how concentrated each new user's activity is: how much of
+it lands in the batch they first appear in, and how many never come back.
+That separates a dataset whose newcomers trickle in from one whose
+newcomers arrive having already rated in bulk (MovieLens elicits ratings
+at signup), which changes what a cold-start remedy can be worth.
+
 The trained set comes from load_id_mappings — the same RecBole filtering the
 checkpoint was trained under — so "new" here means exactly what uid >=
 n_users_trained means inside run_new_user_analysis.py.
@@ -79,10 +85,15 @@ def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
     print(f"  Stream rows:    {len(df):,} ({n_batches} batches of {batch_size}, "
           f"{len(df) - kept} trailing rows unused)")
 
+    # "stat" says how to read n_new/n_total on each row: whole-stream counts,
+    # means across windows, or medians across users. Without it the three
+    # scopes look comparable when they are not, and on the median row the
+    # percentage is the median of each user's own ratio, so it deliberately
+    # does not equal n_new / n_total.
     rows = [
-        {"scope": "stream", "definition": "untrained", "unit": "users",
+        {"scope": "stream", "stat": "count", "definition": "untrained", "unit": "users",
          "n_new": u[unt].nunique(), "n_total": u.nunique()},
-        {"scope": "stream", "definition": "untrained", "unit": "interactions",
+        {"scope": "stream", "stat": "count", "definition": "untrained", "unit": "interactions",
          "n_new": int(unt.sum()), "n_total": len(u)},
     ]
 
@@ -119,21 +130,47 @@ def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
     for unit, total in [("users", "users_total"), ("interactions", "inter_total")]:
         for definition in ["first_appearance", "untrained"]:
             col = f"{'users' if unit == 'users' else 'inter'}_{definition}"
-            rows.append({"scope": "window_mean", "definition": definition, "unit": unit,
-                         "n_new": w[col].mean(), "n_total": w[total].mean()})
+            rows.append({"scope": "window", "stat": "mean", "definition": definition,
+                         "unit": unit, "n_new": w[col].mean(), "n_total": w[total].mean()})
+
+    # How front-loaded a new user's activity is. Per user rather than per
+    # window: at window level the two look proportional on both datasets, and
+    # the difference between them only shows up one user at a time.
+    per_user = pd.DataFrame({"u": u[unt], "batch": pd.Series(range(kept))[unt.values] // batch_size})
+    first_batch = per_user.groupby("u").batch.min()
+    total_each = per_user.groupby("u").size()
+    in_first = (per_user[per_user.batch == per_user.u.map(first_batch)]
+                .groupby("u").size())
+    share_first = (in_first / total_each * 100)
+    n_batches_active = per_user.groupby("u").batch.nunique()
+    one_shot = int((n_batches_active == 1).sum())
+
+    rows += [
+        {"scope": "per_user", "stat": "median", "definition": "untrained",
+         "unit": "interactions_in_first_batch",
+         "n_new": in_first.median(), "n_total": total_each.median(),
+         "pct_override": share_first.median()},
+        {"scope": "per_user", "stat": "count", "definition": "untrained",
+         "unit": "users_never_returning",
+         "n_new": one_shot, "n_total": len(total_each),
+         "pct_override": one_shot / len(total_each) * 100},
+    ]
 
     out = pd.DataFrame(rows)
     # Percentages are per-window then averaged for window rows, so a short
     # final window does not get weighted by its length.
     pct = []
     for r in rows:
-        if r["scope"] == "stream":
+        if "pct_override" in r:
+            pct.append(r.pop("pct_override"))
+        elif r["scope"] == "stream":
             pct.append(r["n_new"] / r["n_total"] * 100)
         else:
             col = f"{'users' if r['unit'] == 'users' else 'inter'}_{r['definition']}"
             tot = "users_total" if r["unit"] == "users" else "inter_total"
             pct.append((w[col] / w[tot] * 100).mean())
     out["pct_new"] = pct
+    out = out.drop(columns="pct_override", errors="ignore")
     out.insert(0, "dataset", dataset_key)
     return out
 
