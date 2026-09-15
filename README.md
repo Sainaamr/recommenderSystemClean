@@ -1,9 +1,23 @@
 # Incremental LightGCN — Streaming Recommender Experiment
 
-Compares three strategies for keeping a LightGCN recommender up to date as new
-interactions stream in — `no_update`, `incremental` (cheap warm-started
-updates), and `full_retrain` (periodic full retraining via RecBole) — tracking
-both recommendation quality (Recall/NDCG/HR/MRR) and energy cost per update.
+Compares strategies for keeping a LightGCN recommender up to date as new
+interactions stream in, tracking both recommendation quality
+(Recall/NDCG/HR/MRR) and energy cost per update.
+
+| Strategy | Script | What it does |
+|---|---|---|
+| `no_update` | `run_incremental_lightgcn.py --no-update` | model frozen; new users get a mean embedding |
+| `incremental` | `run_incremental_lightgcn.py --incremental` | warm-started BPR steps every `update_every` batches |
+| `full_retrain` | `run_incremental_lightgcn.py --full-retrain` | retrains from scratch via RecBole every `update_every` batches |
+| content-init | `run_content_coldstart.py` | new users seeded from item metadata instead of the mean; no retraining |
+| content-incremental | `run_content_incremental.py` | content seeding **and** incremental updates |
+
+`run_new_user_analysis.py` it freezes
+the model and scores existing vs. never-trained users separately, to show how
+much of the quality decay is cold start.
+
+Comparison tables come from `tools/compare_results.py`, figures from
+`tools/plot_utils.py`.
 
 ## Setup
 
@@ -91,22 +105,49 @@ produced against this project's data):
 
 ### 6. Split into historical/realtime
 
-Per-user, time-ordered 80/20 split (first 80% of each user's interactions →
-historical/training, last 20% → realtime/streaming). This is also what
-triggers ml-1m's auto-download if it hasn't happened yet.
+Two splits exist. **Use the time cut** — it is what every current result is
+based on. Either one also triggers ml-1m's auto-download if it hasn't happened
+yet.
+
+**Global time cut (`split_dataset_timecut.py`)** — one cut date at the 80th
+percentile of the timestamp distribution: everything on or before it trains,
+everything after streams. No training interaction post-dates a streamed one, so
+the stream can be read chronologically without the model having seen the future.
 
 ```bash
 cd ~/recommenderSystemClean
 source .venv/bin/activate
+python3 tools/split_dataset_timecut.py --dataset ml-1m
+python3 tools/split_dataset_timecut.py --dataset yelp
+```
+
+```bash
+ls dataset/ml-1m-historical-timecut/ dataset/ml-1m-realtime-timecut/ \
+   dataset/yelp-historical-timecut/ dataset/yelp-realtime-timecut/
+```
+
+**Per-user 80/20 (`split_dataset.py`)** — splits each user's own timeline, so
+the historical set spans the whole period. Kept for reference only: it leaks,
+because at the start of the stream almost all training data post-dates the
+interaction being predicted, and its batches are user blocks rather than time
+slices.
+
+```bash
 python3 tools/split_dataset.py --dataset ml-1m
 python3 tools/split_dataset.py --dataset yelp
 ```
 
-Verify:
+**Unfiltered stream (`split_dataset_timecut_unfiltered.py`)** — optional. Same
+cut and rating filter, but no minimum-interaction filter, so light and
+late-arriving users survive into the stream. Writes the stream only; the
+historical portion and its checkpoint are unchanged. Used to test whether
+new-user arrivals are constant once the filter's right-censoring is removed.
+
 ```bash
-ls dataset/ml-1m-historical/ dataset/ml-1m-realtime/ dataset/yelp-historical/ dataset/yelp-realtime/
+python3 tools/split_dataset_timecut_unfiltered.py --dataset yelp
 ```
-Each should contain one `.inter` file.
+
+Each output directory should contain one `.inter` file.
 
 ## Running an experiment
 
@@ -116,7 +157,7 @@ Long-running — use `screen` (or `tmux`) so it survives disconnecting:
 screen -S recsys
 cd ~/recommenderSystemClean
 source .venv/bin/activate
-python3 experiments/run_incremental_lightgcn.py --dataset yelp --no-update --incremental --full-retrain
+python3 experiments/run_incremental_lightgcn.py --dataset yelp-timecut --no-update --incremental --full-retrain
 ```
 
 Each strategy is opt-in via its own flag — `--no-update`, `--incremental`,
@@ -126,7 +167,22 @@ hyperparameters). `--full-retrain` is the expensive one (retrains LightGCN
 from scratch every `update_every` batches via RecBole). Detach with `Ctrl+A`
 then `D`; reattach later with `screen -r recsys`.
 
-Results land in `results/{dataset}_hybrid_results_{timestamp}.csv` (per-batch
-Recall/NDCG/HR/MRR + energy) and a matching `_incremental_epochs.csv`
-(per-update convergence info: how many epochs each incremental update
-actually ran before early stopping).
+`--dataset` selects an entry from `DATASET_CONFIGS` in
+`experiments/run_incremental_lightgcn.py`: `yelp-timecut` / `ml-1m-timecut`
+(the time cut), `yelp` / `ml-1m` (the per-user split), plus
+`yelp-timecut-unfiltered` and `yelp-timeorder`. `--results-dir` overrides the
+default `results/`; give concurrent runs their own directory, since every run
+in one invocation shares a single start-of-process timestamp and would
+otherwise overwrite.
+
+Outputs, where `{prefix}` is the dataset key without hyphens and `{ts}` is
+`YYYYMMDD_HHMMSS`:
+
+```
+{prefix}_hybrid_results_{strategy}_{ts}.csv    per-batch metrics + per-phase energy, one file per strategy
+{prefix}_hybrid_emissions_summary_{ts}.csv     per-phase energy totals for the run
+```
+
+No figures are written; plot from the CSVs with `tools/plot_utils.py`. The
+content scripts follow the same pattern and additionally write a
+`*_energy.csv` sidecar; they only produce figures in replot mode (`--csv`).
