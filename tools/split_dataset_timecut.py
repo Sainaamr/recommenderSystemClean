@@ -1,21 +1,4 @@
 """
-Split a raw dataset into historical and real-time portions with a GLOBAL TIME
-CUT, so that no training interaction post-dates any streamed interaction.
-
-  Historical — every interaction on or before the cut date → train LightGCN
-  Real-time  — every interaction after the cut date        → simulate streaming
-
-This differs from tools/split_dataset.py, which splits each user's own timeline
-80/20. That per-user split leaves the historical set spanning the entire period,
-so a chronologically-ordered stream is evaluated by a model that has already
-seen the future: at the start of the stream ~99% of the training data post-dates
-the interaction being predicted. A global cut removes that leakage entirely, at
-the cost that users who only became active after the cut are absent from
-training — which is the realistic cold-start population.
-
-The cut is placed at the timestamp quantile that puts `ratio` of all
-interactions in the historical portion.
-
 Usage:
   python tools/split_dataset_timecut.py --dataset yelp
   python tools/split_dataset_timecut.py --dataset yelp --split 0.8
@@ -38,7 +21,7 @@ import pandas as pd
 from recbole.config import Config
 from recbole.data import create_dataset
 
-# ── Per-dataset settings ──────────────────────────────────────────────────────
+
 SPLIT_CONFIGS = {
     "ml-1m": {
         "dataset":       "ml-1m",
@@ -50,10 +33,6 @@ SPLIT_CONFIGS = {
     },
     "yelp": {
         "dataset":       "yelp",
-        # yelp_dataset_split.yaml keeps users from 3 interactions instead of 10,
-        # so users with 3-9 interactions survive into the stream. Training later
-        # loads the historical file with yelp_dataset.yaml ("[10, inf)"), which
-        # excludes them from the model — making them cold-start users.
         "config_files":  ["configs/yelp_dataset_split.yaml", "configs/yelp_historical_eval.yaml", "configs/lightgcn.yaml"],
         "hist_dir":      Path("dataset/yelp-historical-timecut"),
         "realtime_dir":  Path("dataset/yelp-realtime-timecut"),
@@ -84,7 +63,7 @@ def split(dataset_key: str, ratio: float = 0.8):
     df["user_id"] = [user_tokens[i] for i in df["user_id"]]
     df["item_id"] = [item_tokens[i] for i in df["item_id"]]
 
-    # ── the only structural difference: one global cut, in time ──────────────
+
     df = df.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
     cut = df["timestamp"].quantile(ratio)
     historical = df[df["timestamp"] <= cut].reset_index(drop=True)

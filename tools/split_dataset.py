@@ -1,13 +1,4 @@
 """
-Split a raw dataset into historical and real-time portions using RecBole's
-dataset loader for filtering (rating>=3, min interactions, etc.), then a
-per-user time-ordered split on the filtered data.
-
-  Historical (80%)  — first 80% of each user's interactions → train LightGCN
-  Real-time  (20%)  — last 20% of each user's interactions  → simulate streaming
-
-Every user appears in both splits — no user gets dropped.
-
 Usage:
   python tools/split_dataset.py --dataset ml-1m
   python tools/split_dataset.py --dataset yelp --split 0.8
@@ -29,7 +20,7 @@ import pandas as pd
 from recbole.config import Config
 from recbole.data import create_dataset
 
-# ── Per-dataset settings ──────────────────────────────────────────────────────
+
 SPLIT_CONFIGS = {
     "ml-1m": {
         "dataset":      "ml-1m",
@@ -48,7 +39,6 @@ SPLIT_CONFIGS = {
         "realtime_file": "yelp-realtime.inter",
     },
 }
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def split(dataset_key: str, ratio: float = 0.8):
@@ -62,21 +52,18 @@ def split(dataset_key: str, ratio: float = 0.8):
     )
     dataset = create_dataset(config)
 
-    # inter_feat is a DataFrame with internal integer IDs
     df = dataset.inter_feat.copy()
     print(f"  Total interactions after filtering: {len(df)}")
     print(f"  Users: {df['user_id'].nunique()}, Items: {df['item_id'].nunique()}")
 
-    # Convert internal IDs back to original tokens
-    user_tokens = dataset.field2id_token["user_id"]  # index=internal_id, value=token
+
+    user_tokens = dataset.field2id_token["user_id"]  
     item_tokens = dataset.field2id_token["item_id"]
     df["user_id"] = [user_tokens[i] for i in df["user_id"]]
     df["item_id"] = [item_tokens[i] for i in df["item_id"]]
 
-    # Sort each user's interactions by timestamp
     df = df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
 
-    # Per-user split
     historical_rows = []
     realtime_rows   = []
 
@@ -88,7 +75,6 @@ def split(dataset_key: str, ratio: float = 0.8):
     historical = pd.concat(historical_rows).reset_index(drop=True)
     realtime   = pd.concat(realtime_rows).reset_index(drop=True)
 
-    # Rename columns to RecBole .inter format
     historical = historical.rename(columns={
         "user_id": "user_id:token", "item_id": "item_id:token",
         "rating": "rating:float", "timestamp": "timestamp:float",

@@ -1,24 +1,21 @@
 """
-Content-aware cold-start experiment for new users.
-
-New users get a content-based embedding (ContentUserInitializer) written
-once into a persistent row in the embedding table — the same mechanism
-run_content_incremental.py uses, minus the periodic gradient update. Once
-seeded, a user's row is never touched again for the rest of the run.
-Existing and new users are scored identically, by reading directly from
-that table.
-
-LightGCN is never retrained.
+Content-based cold-start experiment for new users.
 
 Usage:
   python experiments/run_content_coldstart.py --dataset yelp
   python experiments/run_content_coldstart.py --dataset ml-1m-timecut
   python experiments/run_content_coldstart.py --dataset yelp --csv results/existing.csv
 
-Note: requires item metadata. yelp uses geohash cells (primary) and business
-categories (secondary); ml-1m uses genre (primary) and release decade
-(secondary). The roles are swapped because release year barely separates
-users — 59% of ml-1m films are from the 1990s.
+Outputs:
+ 
+{prefix} is the dataset key without
+{ts} is YYYYMMDD_HHMMSS):
+
+  {prefix}_content_coldstart_{ts}.csv          
+  {prefix}_content_coldstart_{ts}_energy.csv   
+Only in --csv: 
+  <input>_replot_vs_no_update_overall_{recall,precision,ndcg}.pdf
+  <input>_replot_vs_no_update_groups_{recall,precision,ndcg}.pdf
 """
 
 import os, sys, argparse, torch
@@ -50,16 +47,11 @@ ITEM_META_PATHS = {"yelp": "dataset/yelp/yelp.item",
 
 
 # Per-batch scoring
-
 def score_batch(user_emb, item_emb, existing_gt, new_user_gt, history, k: int = 10):
     """
-    Scores existing AND new users the same way — reading directly from the
-    embedding table row, matching run_content_incremental.py's score_batch.
-    No inline recomputation here; whatever was last written to a user's row
-    (mean-init or content-seeded) is what gets scored.
+    Scores existing AND new users 
 
-    Returns (m_existing, m_new_content, m_overall_content) — each an
-    _avg()-averaged metrics dict (recall@k, precision@k, ndcg@k, ...).
+    Returns (m_existing, m_new_content, m_overall_content) averaged
     """
     def score_uid(uid, gt):
         scores = torch.matmul(user_emb[uid], item_emb.T).cpu().numpy()
@@ -79,8 +71,6 @@ def _apply_content_seeds_once(lgcn: IncrementalLightGCN, content_init: ContentUs
     """
     One-time content seed: for every still-unseeded uid with accumulated
     history, write a content-based embedding into their row exactly once.
-    No gradient training exists in this script, so once seeded, a row is
-    never touched again for the rest of the run.
     """
     seed = {}
     for uid, items in accumulated_items.items():
@@ -141,11 +131,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
 
     geo_precision = 4
     ckpt_path = Path(cfg["checkpoint"])
-    # ml-1m keys on genre + release decade; yelp on geohash + categories. The
-    # schema goes in the cache name so the two never collide and an existing
-    # yelp index stays valid.
-    # cfg["dataset"] is the RecBole dataset name, e.g. "ml-1m-historical-timecut"
-    # or "yelp-historical-timecut" — available here, unlike argparse's args.
     schema     = "ml-1m" if cfg["dataset"].startswith("ml-1m") else "yelp"
     cache_path = ckpt_path.with_name(
         f"{ckpt_path.stem}-content_init-{schema}-geo{geo_precision}.pkl")
@@ -153,7 +138,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
     if cache_path.exists():
         print(f"Found existing content-index cache: {cache_path}")
         content_init = ContentUserInitializer.load(str(cache_path))
-        # No build happened — nothing to measure.
         content_build_emissions_mg = 0.0
     else:
         tracker.start_task("content_build")
@@ -165,7 +149,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
             historical_inter_path = cfg["historical_path"],
             user2id               = user2id,
             item2id               = item2id,
-            # One-time NumPy snapshot for the geo/category index
             user_emb              = user_emb.cpu().numpy(),
         )
         content_init.save(str(cache_path))
@@ -180,8 +163,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
     n_batches = len(df_rt) // BATCH_SIZE
 
     # uid -> accumulated item list, in ContentUserInitializer.get_embedding()'s
-    # native mixed format (int iid for trained items, str token for items
-    # that were themselves excluded from training)
+    # int iid for trained items, str token for items
     accumulated_items: dict = {}
     content_seeded: set = set()   # uids that have already received their one-time content seed
     seen_as_new: set = set()      # every uid ever classified as "new" so far
@@ -191,10 +173,6 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
 
     for i in range(n_batches):
 
-        # Batch body split into named, back-to-back sub-tasks (no gaps
-        # between stop_task() and the next start_task()), so each phase's
-        # own cost is saved separately in the CSV, and batch_emissions_mg
-        # (their sum) is still the accurate whole-batch total.
         tracker.start_task(f"batch_{i}_id_resolution")
 
         batch = df_rt.iloc[i * BATCH_SIZE:(i + 1) * BATCH_SIZE].copy()
@@ -294,9 +272,7 @@ def run_content_coldstart(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, fl
         seen_as_new |= new_user_set
         pct_new_users = n_new_users / max(len(set(batch_users)), 1)
 
-        # After scoring only: update history, and grow accumulated_items for
-        # new users (their content embedding, if not yet seeded, gets built
-        # from this once they're picked up by _apply_content_seeds_once below).
+        # After scoring only: update history, and grow accumulated_items for new users 
         for uid, iid in zip(batch_users, batch_items):
             history.setdefault(uid, set()).add(iid)
             if uid >= n_users_trained:
@@ -385,11 +361,7 @@ def merge_new_user_baseline(df: pd.DataFrame, new_user_csv: Path) -> pd.DataFram
 
 def merge_no_update_overall(df: pd.DataFrame, no_update_csv: Path) -> pd.DataFrame:
     """
-    Merge in the overall recall/precision/ndcg from a
-    run_incremental_lightgcn.py no_update-strategy results CSV, joined on
-    batch. That script scores everyone together (no existing/new-user
-    split), so this only supplies an aggregate "no update" baseline — use
-    merge_new_user_baseline instead for the existing/new/overall breakdown.
+     use merge_new_user_baseline instead for the existing/new/overall breakdown.
     """
     baseline = pd.read_csv(no_update_csv)[[
         "batch", "recall_at_10", "precision_at_10", "ndcg_at_10",

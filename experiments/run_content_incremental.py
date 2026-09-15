@@ -1,28 +1,19 @@
 """
-Combined content-aware cold-start + incremental update experiment.
-
-New users get a content-based cold-start embedding (ContentUserInitializer)
-instead of a plain mean embedding, AND the model itself keeps periodically
-fine-tuning via real BPR gradient steps (IncrementalLightGCN.incremental_update),
-
-
-Recovered historical interactions for users excluded from training (real data
-that exists in the historical file but was filtered out by RecBole's
-interaction-count threshold) are used two ways:
-  1. to compute that user's initial content-based embedding immediately, and
-  2. fed as real graph edges into the next incremental_update, so this
-     otherwise-discarded signal actually gets learned via gradient descent,
-     not just used as a passive similarity heuristic.
+Combined strategy
 
 Usage:
   python experiments/run_content_incremental.py --dataset yelp
   python experiments/run_content_incremental.py --dataset ml-1m-timecut
   python experiments/run_content_incremental.py --dataset yelp --csv results/existing.csv
 
-Note: requires item metadata. yelp uses geohash cells (primary) and business
-categories (secondary); ml-1m uses genre (primary) and release decade
-(secondary). The roles are swapped because release year barely separates
-users — 59% of ml-1m films are from the 1990s.
+Outputs:
+{prefix} is the dataset 
+{ts} is YYYYMMDD_HHMMSS:
+  {prefix}_content_incremental_{ts}.csv          
+  {prefix}_content_incremental_{ts}_energy.csv   
+
+Only in mode --csv:
+  <input>_replot_groups_{recall,precision,ndcg}.pdf
 """
 
 import os, sys, argparse, torch
@@ -90,9 +81,7 @@ def _apply_content_seeds_once(lgcn: IncrementalLightGCN, content_init: ContentUs
                                accumulated_items: dict, content_seeded: set, gradient_touched: set) -> int:
     """
     Content-init is a one-time INITIALIZATION,
-    For every still-new uid that has never yet been content-seeded, seed it
-    exactly once from whatever's accumulated in accumulated_items so far
-    their later interactions simply accumulate into the update buffer for incremental_update
+    For every still-new uid that has never yet been content-seeded
     """
     seed = {}
     # Loop over the users tracked so far.
@@ -174,18 +163,12 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
     print("\n── Building content-aware user index ────────────────────────────────")
     geo_precision = 4
     ckpt_path = Path(cfg["checkpoint"])
-    # ml-1m keys on genre + release decade; yelp on geohash + categories. The
-    # schema goes in the cache name so the two never collide and an existing
-    # yelp index stays valid.
-    # cfg["dataset"] is the RecBole dataset name, e.g. "ml-1m-historical-timecut"
-    # or "yelp-historical-timecut" — available here, unlike argparse's args.
     schema     = "ml-1m" if cfg["dataset"].startswith("ml-1m") else "yelp"
     cache_path = ckpt_path.with_name(
         f"{ckpt_path.stem}-content_init-{schema}-geo{geo_precision}.pkl")
     if cache_path.exists():
         print(f"Found existing content-index cache: {cache_path}")
         content_init = ContentUserInitializer.load(str(cache_path))
-        # No build happened — nothing to measure.
         content_build_emissions_mg = 0.0
     else:
         tracker.start_task("content_build")
@@ -211,10 +194,8 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
     n_batches = len(df_rt) // BATCH_SIZE
     update_every = cfg.get("update_every", UPDATE_EVERY)
 
-    # uid -> accumulated item list, in ContentUserInitializer.get_embedding()'s
-    # native mixed format (int iid for trained items, str token for items
-    # that were themselves excluded from training)
-    accumulated_items: dict = {} # uid -> list of items that user has interacted with so far (
+
+    accumulated_items: dict = {} # uid -> list of items that user has interacted with so far 
     content_seeded: set = set()     # uids that have already received their one-time content seed
     gradient_touched: set = set()   # uids that have been through >=1 incremental_update
     seen_as_new: set = set() # every uid that has ever been classified as "new" a
@@ -266,7 +247,7 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
         for uid, u_tok in newly_arrived:
             hist_items = content_init.get_excluded_history(u_tok) # user recovered history
             if not hist_items:
-                continue  # no recovered history -> mean-init fallback
+                continue  
 
 
             promoted = [] #  include normal trained item id and ids of new assignees. hist_items  includes new assignees as str
@@ -286,7 +267,7 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
 
             content_seed_this_batch[uid] = content_init.get_embedding(hist_items) # Content seed computed from the recovered history itself
             accumulated_items[uid] = list(hist_items)
-            content_seeded.add(uid) # mark as seeded so it's not recomputed
+            content_seeded.add(uid) # mark as seeded
 
         recovered_history_seed_emissions_mg = task_mg(tracker.stop_task())
 
@@ -360,17 +341,13 @@ def run_content_incremental(cfg: dict, ckpt: str) -> tuple[pd.DataFrame, float, 
         )
         streaming_emissions_mg += batch_emissions_mg
 
-        # ---- Periodic incremental update ----
+        # incremental update 
         update_emissions_mg = 0.0
         updated = False
         if (i + 1) % update_every == 0:
             new_users_arr = np.array(buffer_users)
             new_items_arr = np.array(buffer_items)
 
-            # Back-to-back with the batch task just stopped above — no gap.
-            # Covers the gradient update AND the post-update forward-pass
-            # refresh below, so no time between this and the next batch's
-            # task goes unmeasured.
             tracker.start_task(f"batch_{i}_update")
             lgcn.add_interactions(new_users_arr, new_items_arr)
             lgcn.incremental_update(new_users_arr, new_items_arr, n_epochs=UPDATE_EPOCHS)
@@ -483,8 +460,7 @@ def main():
         df.to_csv(out_csv, index=False)
         print(f"\nResults saved → {out_csv}")
 
-        # Aggregated from the already-measured per-batch columns — same
-        # values the console summary below prints, now persisted too.
+
         n_updates               = int(df["updated"].sum())
         total_update_emissions  = df["update_emissions_mg"].sum()
         total_batch_emissions   = df["batch_emissions_mg"].sum()
@@ -507,8 +483,6 @@ def main():
         plot_df = merge_new_user_baseline(df, args.new_user_csv)
         print(f"Merged mean-init baseline from {args.new_user_csv}")
 
-    # Only plot in replot mode (--csv) — a fresh run just produces the CSV;
-    # generate plots separately later via --csv <path>.
     if args.csv:
         plot_content_incremental_groups(plot_df, out_png, "Content Incremental",
                                         subtitle="Yelp Dataset")

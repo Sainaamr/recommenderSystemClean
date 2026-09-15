@@ -1,18 +1,18 @@
 """
-New user drift analysis.
-
-Isolates the impact of new users on LightGCN recall over the streaming period.
-Model never retrains. New users receive mean-initialised embeddings (cold-start fallback).
-
-Three groups scored per batch:
-  existing : uid < n_users_trained
-  new_user : uid >= n_users_trained (mean embedding)
-  overall  : all users combined
+New user analysis.
 
 Usage:
   python experiments/run_new_user_analysis.py --dataset yelp
   python experiments/run_new_user_analysis.py --dataset ml-1m
   python experiments/run_new_user_analysis.py --dataset yelp --csv results/existing.csv
+Output:
+    {prefix}_new_user_analysis_{ts}.csv  
+in mode (--csv):
+    <input>_replot_recall.pdf
+    <input>_replot_precision.pdf
+    <input>_replot_ndcg.pdf
+    <input>_replot_new_user_arrivals.pdf
+    <input>_replot_interaction_volume.pdf
 """
 
 import os, sys, argparse, torch
@@ -83,7 +83,6 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
     # number of users trained on
     n_users_trained = lgcn.n_users
 
-    # realtime_path is pre-filtered to rating>=3 by tools/split_dataset.py
     df_rt = pd.read_csv(cfg["realtime_path"], sep="\t")
 
     id_cast  = cfg["id_cast"]
@@ -108,25 +107,8 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
     n_batches = len(df_rt) // BATCH_SIZE
     records   = []
 
-    # Tracks every uid ever classified as "new" so far, so a user whose
-    # interactions straddle a batch boundary
     seen_as_new = set()
-
-    # Tracks unique active uids since the last UPDATE_EVERY-batch window
     window_active_users = set()
-
-    # Same, restricted to untrained uids. Needed because "new user" is used in
-    # two different senses here and they must not be mixed in one comparison:
-    #
-    #   arrivals  — uids classified as new for the FIRST time in this batch
-    #               (n_new_users). Answers "how many people showed up".
-    #   untrained — every uid the model was never trained on, however long ago
-    #               they first appeared (n_untrained_users_active). This is the
-    #               population the recall_new_user metric scores, and the one
-    #               n_new_user_interactions counts interactions for.
-    #
-    # Pairing an arrivals count against an untrained interaction count
-    # understates activity-per-user by ~5.6x on yelp-timecut.
     window_untrained_users = set()
 
     print(f"  Streaming {n_batches} batches (no retraining)...")
@@ -145,9 +127,7 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
                 max(max_i + 1, lgcn.n_items),
             )
 
-        # Split this batch's ground truth by existing vs new user — the
-        # classification itself lives here, not inside score_batch, so that
-        # function only has to worry about scoring whatever split it's given.
+        # Split this batch's ground truth by existing vs new user
         existing_gt = {}
         new_user_gt = {}
         for uid, iid in zip(batch_users, batch_items):
@@ -165,27 +145,20 @@ def run_new_user_analysis(cfg: dict, ckpt: str) -> pd.DataFrame:
         seen_as_new |= new_user_set
         n_new_users = len(first_time_new)
 
-        # Interaction-volume count: every raw row in this batch whose uid is
-        # classified as new_user — i.e. the UNTRAINED population, not just the
-        # users arriving now. Matches what recall_new_user scores.
+        # Interaction-volume count
         n_new_user_interactions = sum(1 for uid in batch_users if uid >= n_users_trained)
 
-        # The arrivals-basis counterpart: interactions belonging only to users
-        # appearing for the first time in this batch. Pair this with
-        # n_new_users; pair n_new_user_interactions with
-        # n_untrained_users_active.
+   
         n_first_time_new_user_interactions = sum(1 for uid in batch_users if uid in first_time_new)
 
-        # All untrained users active in this batch, regardless of when they
-        # first appeared — the denominator that matches n_new_user_interactions.
+        # All untrained 
         n_untrained_users_active = len(new_user_set)
 
         n_unique_users = len(set(batch_users))
         pct_new_user = n_new_users / max(n_unique_users, 1)
         pct_untrained_users = n_untrained_users_active / max(n_unique_users, 1)
 
-        # Running, deduplicated counts of unique active users since the last
-        # window boundary — all users, and the untrained subset.
+    
         window_active_users.update(batch_users)
         window_unique_users = len(window_active_users)
         window_untrained_users.update(new_user_set)

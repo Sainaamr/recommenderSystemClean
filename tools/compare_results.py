@@ -1,28 +1,21 @@
 """
-Statistically compare two paired sequences of a metric, batch-for-batch.
-
-One purpose-built function per comparison — import and call directly, or
-use the matching CLI subcommand. Add a new function + subcommand here as
-new comparisons come up.
-
-For each metric compared, reports mean of each group, gap, % improvement,
-win rate, and a Wilcoxon signed-rank p-value. Rows are aligned on 'batch'
-via inner merge before comparing.
-
-CLI usage:
-    python3 tools/compare_results.py no-update-vs-incremental \
-        --baseline-csv results/old/yelp_hybrid_results_no_update_20260716_184135.csv \
-        --comparison-csv results/yelp_hybrid_results_incremental_....csv \
-        [--metric recall_at_10] [--out out.csv] [--latex out.tex]
-
-    python3 tools/compare_results.py new-user-analysis \
-        --csv results/yelp_new_user_analysis_20260808_200908.csv \
-        [--out out.csv] [--latex out.tex]
-
-Python usage:
-    from tools.compare_results import compare_no_update_vs_incremental, compare_new_user_analysis
-    compare_no_update_vs_incremental("no_update.csv", "incremental.csv")
-    compare_new_user_analysis("new_user_analysis.csv")
+usage:
+python tools/compare_results.py <subcommand> <inputs> [--out X.csv] [--latex X.tex]
+| Subcommand                  | Inputs                                                                                                                                   
+|-----------------------------|----------------------------------------------------------------------------------------------------------------------------------------  
+| no-update-vs-incremental    | --baseline-csv --comparison-csv · optional --baseline-label --comparison-label --metric                                                  
+| new-user-analysis           | --csv                                                                                                                                    
+| new-user-windows            | --csv · optional --update-every (default 20)                                                                                             
+| no-update-vs-content-init   | --no-update-csv --content-csv · optional --metric                                                                                        
+| content-coldstart           | --csv                                                                                                                                    
+| content-incremental-vs-all  | --content-incremental-csv --no-update-csv --incremental-csv --content-csv · optional --metric                                            
+| content-init-vs-incremental | --content-csv --incremental-csv · optional --metric                                                                                      
+| energy-summary              | four pairs: --{no-update,incremental,content-coldstart,content-incremental}-csv plus a matching -results-csv for each                     
+| energy-summary-compact      | same eight as above                                                                                                                      
+| energy-summary-hybrid       | --no-update-csv --no-update-results-csv --incremental-csv --incremental-results-csv --full-retrain-training-json --full-retrain-results-csv 
+| full-retrain-vs-all         | --full-retrain-csv --no-update-csv --incremental-csv · optional --metric                                                                 
+| frequency-vs-baseline       | --csv-dir · optional --baseline-update-every (default 270)                                                                               
+| update-cost                 | --csv label=path, repeatable · optional --training-emissions-mg                                                                          
 """
 
 import argparse
@@ -43,15 +36,7 @@ from tools.plot_utils import (METRIC_LABELS, _CONTENT_COLDSTART_METRICS, plot_en
 
 def compare_columns(df_a: pd.DataFrame, col_a: str, label_a: str,
                     df_b: pd.DataFrame, col_b: str, label_b: str) -> dict:
-    """
-    Paired comparison between col_a (reference) and col_b (comparison),
-    aligned on 'batch'. df_a/df_b may be the same DataFrame (two columns in
-    one CSV) or two different DataFrames (same column name, two CSVs).
 
-    Returns: mean_{label_a}, mean_{label_b}, mean_gap, pct_improvement,
-    win_rate, wilcoxon_p, n_batches. No file output — a helper for the
-    compare_* functions below.
-    """
     left  = df_a[["batch", col_a]].rename(columns={col_a: "_a"})
     right = df_b[["batch", col_b]].rename(columns={col_b: "_b"})
     merged = pd.merge(left, right, on="batch")
@@ -81,16 +66,7 @@ def compare_columns(df_a: pd.DataFrame, col_a: str, label_a: str,
 
 
 def format_for_latex(summary: pd.DataFrame) -> pd.DataFrame:
-    """
-    Formats a compare_* summary for a thesis LaTeX table: fixed decimals
-    for mean/gap columns, literal '%' for pct columns, scientific notation
-    for wilcoxon_p (values commonly run ~1e-30 to 1e-90). Matched by
-    column-name prefix since different compare_* functions produce
-    different column sets.
 
-    Returns a string-valued DataFrame ready for to_latex(); no file output
-    itself — see _report.
-    """
     has_real_index = summary.index.name is not None or isinstance(summary.index, pd.MultiIndex)
     df = summary.reset_index() if has_real_index else summary.copy()
     for col in df.columns:
@@ -129,15 +105,7 @@ def compare_no_update_vs_incremental(baseline_csv, comparison_csv,
                                      comparison_label: str = "incremental",
                                      metric: str = None,
                                      out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares two run_incremental_lightgcn.py results CSVs batch-for-batch
-    on every shared metric column (or just `metric`). baseline_label/
-    comparison_label name the mean_ columns — override for pairs other than
-    the default no_update/incremental (e.g. full_retrain vs incremental).
 
-    Outputs (results/recent/, when --out/--latex point there):
-    yelp_no_update_vs_incremental_compare.csv, yelp_no_update_vs_incremental_compare.tex
-    """
     df_a = pd.read_csv(baseline_csv)
     df_b = pd.read_csv(comparison_csv)
 
@@ -165,15 +133,7 @@ def compare_no_update_vs_incremental(baseline_csv, comparison_csv,
 def compare_no_update_vs_content_init(no_update_csv, content_csv,
                                       metric: str = None,
                                       out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares a run_incremental_lightgcn.py no_update CSV's overall
-    recall/precision/ndcg ("{metric}_at_10") against a
-    run_content_coldstart.py CSV's overall content-init performance
-    ("{metric}_overall_content"), batch-for-batch.
 
-    Outputs (results/recent/): yelp_no_update_vs_content_init_compare.csv,
-    yelp_no_update_vs_content_init_compare.tex
-    """
     df_a = pd.read_csv(no_update_csv)
     df_b = pd.read_csv(content_csv)
 
@@ -199,19 +159,7 @@ def compare_no_update_vs_content_init(no_update_csv, content_csv,
 def compare_content_init_vs_incremental(content_csv, incremental_csv,
                                         metric: str = None,
                                         out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares a run_content_coldstart.py CSV's overall content-init
-    performance ("{metric}_overall_content") against a
-    run_incremental_lightgcn.py incremental CSV's overall recall/precision/
-    ndcg ("{metric}_at_10"), batch-for-batch. incremental is the baseline
-    (mean_incremental), content_init is the comparison — pct_improvement is
-    content_init's gap over incremental, as a percentage of incremental's
-    mean. Restricted to recall/precision/ndcg@10; drops n_batches and
-    mean_gap, which no_update-vs-content-init keeps but aren't wanted here.
-
-    Outputs (results/recent/): yelp_content_init_vs_incremental_compare.csv,
-    yelp_content_init_vs_incremental_compare.tex
-    """
+  
     df_a = pd.read_csv(incremental_csv)
     df_b = pd.read_csv(content_csv)
 
@@ -237,16 +185,7 @@ def compare_content_incremental_vs_all(content_incremental_csv, no_update_csv,
                                        incremental_csv, content_csv,
                                        metric: str = None,
                                        out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares content_incremental's overall performance
-    ("{metric}_overall_content") against no_update, incremental
-    ("{metric}_at_10") and content-init ("{metric}_overall_content"). One
-    row per metric: content_incremental's mean, plus its % improvement over
-    each of the three baselines.
-
-    Outputs (results/): yelp_content_incremental_vs_all_compare.csv,
-    yelp_content_incremental_vs_all_compare.tex
-    """
+  
     df_ci = pd.read_csv(content_incremental_csv)
     df_no_update = pd.read_csv(no_update_csv)
     df_incremental = pd.read_csv(incremental_csv)
@@ -284,15 +223,7 @@ def compare_content_incremental_vs_all(content_incremental_csv, no_update_csv,
 def compare_full_retrain_vs_all(full_retrain_csv, no_update_csv, incremental_csv,
                                 metric: str = None,
                                 out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares full_retrain's performance against no_update and incremental —
-    all three from run_incremental_lightgcn.py, sharing the identical
-    "{metric}_at_10" schema (e.g. the MovieLens 3-strategy comparison,
-    \autoref{section:movielens-results}). One row per metric: full_retrain's
-    mean, plus its % improvement over each of the two baselines.
 
-    Outputs: prints table; saves to `out`/`latex` if given.
-    """
     df_fr = pd.read_csv(full_retrain_csv)
     df_no_update = pd.read_csv(no_update_csv)
     df_incremental = pd.read_csv(incremental_csv)
@@ -325,21 +256,7 @@ def compare_full_retrain_vs_all(full_retrain_csv, no_update_csv, incremental_csv
 
 def compare_frequency_sweep_vs_baseline(csv_dir, baseline_update_every: int = 270,
                                         out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares every content_incremental update-frequency run discovered in
-    csv_dir (see plot_utils._discover_frequency_runs — the same set of runs
-    behind plot_content_incremental_quality_vs_energy) against one baseline
-    frequency, default 270 (the least frequent / cheapest run in the sweep).
-    One row per update_every value, columns = % improvement in Recall@10,
-    Precision@10, NDCG@10 ("{metric}_overall_content", batch-for-batch via
-    compare_columns) and % change in streaming energy
-    (streaming_emissions_mg, from each run's *_energy.csv sidecar), all
-    relative to the baseline run.
-
-    Outputs (results/frequency_change/):
-    yelp_content_incremental_frequency_vs_baseline_compare.csv,
-    ...vs_baseline_compare.tex
-    """
+ 
     entries = _discover_frequency_runs(csv_dir)
     energies = _frequency_run_energies(entries)
     valid = {ue: (df, e) for (ue, df, _), e in zip(entries, energies) if e is not None}
@@ -372,21 +289,7 @@ def compare_frequency_sweep_vs_baseline(csv_dir, baseline_update_every: int = 27
 
 def compare_update_cost(strategy_csvs: dict, training_emissions_mg: float = None,
                         out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Summarizes update_emissions_mg per strategy — number of updates, mean
-    cost per update, and total cost across all updates — one row per entry
-    in strategy_csvs ({label: results_csv_path}, e.g. {"full_retrain": ...,
-    "incremental": ...}). Works on any run_incremental_lightgcn.py results
-    CSV with "update_emissions_mg"/"updated" columns.
-
-    training_emissions_mg, if given, adds a "total_with_training_mg" column
-    (training + this strategy's update total) — both strategies share the
-    same one-time training cost, so the update-only ratio between them
-    overstates the gap in total lifecycle cost; this column shows the
-    narrower, fuller picture.
-
-    Outputs: prints table; saves to `out`/`latex` if given.
-    """
+  
     rows = []
     for label, csv_path in strategy_csvs.items():
         df = pd.read_csv(csv_path)
@@ -408,19 +311,7 @@ def compare_update_cost(strategy_csvs: dict, training_emissions_mg: float = None
 
 
 def compare_new_user_analysis(csv, out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares existing/new_user against overall within one
-    run_new_user_analysis.py CSV, for every metric with all three group
-    columns ("{metric}_existing"/"{metric}_new_user"/"{metric}_overall").
-    'overall' is the reference point — the actual blended metric across
-    every user in the batch.
-
-    One row per metric, with all three raw means side by side plus
-    pct_improvement for existing-vs-overall and new_user-vs-overall.
-
-    Outputs (results/recent/): yelp_new_user_pairwise_compare.csv,
-    yelp_new_user_pairwise_compare.tex
-    """
+    
     df = pd.read_csv(csv)
     suffix = "_existing"
     prefixes = [
@@ -454,23 +345,7 @@ def compare_new_user_analysis(csv, out: Path = None, latex: Path = None) -> pd.D
 
 
 def compare_content_coldstart(csv, out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compares existing/new against overall within one results CSV that uses
-    content-init's column schema ("{metric}_existing"/"{metric}_new_content"/
-    "{metric}_overall_content") — mirrors compare_new_user_analysis against
-    that naming. Works on both run_content_coldstart.py and
-    run_content_incremental.py CSVs, since they share the identical schema.
-    Restricted to _CONTENT_COLDSTART_METRICS (recall/precision/ndcg), since
-    these CSVs also have hr/mrr, not wanted here.
-
-    One row per metric, with all three raw means side by side plus
-    pct_improvement for existing-vs-overall and new-vs-overall.
-
-    Outputs (results/recent/): yelp_content_coldstart_compare.csv,
-    yelp_content_coldstart_compare.tex (from run_content_coldstart.py); or
-    (results/): yelp_content_incremental_pairwise_compare.csv,
-    yelp_content_incremental_pairwise_compare.tex (from run_content_incremental.py)
-    """
+  
     df = pd.read_csv(csv)
     prefixes = [
         m for m, _, _ in _CONTENT_COLDSTART_METRICS
@@ -504,43 +379,7 @@ def compare_content_coldstart(csv, out: Path = None, latex: Path = None) -> pd.D
 
 def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 1000,
                                out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Summarizes a run_new_user_analysis.py CSV at the update_every-batch
-    window level (same window an incremental update trains on — see
-    tools/plot_utils._plot_new_user_arrivals/_plot_interaction_volume),
-    averaged across all windows. Two rows, one per counting unit:
-
-      "users"        — people-counts per window: n_new_users (users seen
-                        for the first time in this window; first
-                        appearances are disjoint across batches, so
-                        summing them is correct) over window_unique_users
-                        (a running, cross-batch-deduplicated count reset
-                        every update_every batches — summing the per-batch
-                        n_unique_users column instead would double-count
-                        repeat visitors within a window).
-      "interactions" — raw event counts per window, via
-                        n_first_time_new_user_interactions (always safe to
-                        sum, no dedup needed).
-
-    Both rows count the same population: users arriving for the first time.
-    Earlier versions took "users" from n_new_users (first appearances) but
-    "interactions" from n_new_user_interactions, which counts events from
-    every untrained user however long ago they arrived. Those two are not
-    comparable — on yelp-timecut a window holds 888 first appearances but
-    3,875 untrained users, so pairing them made new users look ~5.6x more
-    active per head than they are.
-
-    Use n_new_user_interactions / window_unique_untrained_users instead if
-    the question is cold-start coverage ("how much traffic has no trained
-    embedding") rather than arrivals ("how many people showed up").
-
-    pct_new (both rows) is new/total per window, averaged — not computed
-    from the mean_new/mean_total columns — matching how the CSV's own
-    pct_new_user column is a per-batch mean-of-ratios.
-
-    Outputs (results/recent/): yelp_new_user_windows_summary_20260809_190658.csv,
-    yelp_new_user_windows_summary_20260809_190658.tex
-    """
+  
     df = pd.read_csv(csv)
     required = ["n_new_users", "window_unique_users",
                 "n_first_time_new_user_interactions"]
@@ -585,9 +424,7 @@ def summarize_new_user_windows(csv, update_every: int = 20, batch_size: int = 10
     return summary
 
 
-# Row order for compare_energy_summary's transposed table. A section NaN
-# for a run means that phase doesn't apply to it (e.g. update_prep is
-# hybrid-only, apply_content_seeds is content-only).
+
 _ENERGY_SUMMARY_SECTIONS = [
     "training_emissions_mg",
     "id_mapping_emissions_mg",
@@ -611,8 +448,6 @@ _ENERGY_SUMMARY_SECTIONS = [
     "grand_total_mg",
 ]
 
-# Sub-task columns summed out of each per-batch results CSV (not the energy
-# sidecar) for the batch-loop breakdown rows above.
 _HYBRID_BATCH_SUBTASKS = [
     "id_resolution_emissions_mg", "expand_embeddings_emissions_mg",
     "scoring_emissions_mg", "update_prep_emissions_mg", "history_update_emissions_mg",
@@ -671,12 +506,7 @@ def _energy_from_content(csv_path, results_csv_path):
 
 
 def _energy_from_legacy_full_retrain(training_json_path, results_csv_path) -> dict:
-    """
-    For a full_retrain run that predates this session's section-breakdown
-    tracking — only a bare {"training_emissions_mg": ...} JSON and a
-    results CSV with update_emissions_mg/updated, no other sections
-    measured at all, so everything else is NaN.
-    """
+
     training_emissions_mg = json.loads(Path(training_json_path).read_text())["training_emissions_mg"]
     results = pd.read_csv(results_csv_path)
     n_updates = int(results["updated"].sum())
@@ -708,15 +538,7 @@ def compare_energy_summary_hybrid(no_update_csv, no_update_results_csv,
                                   incremental_csv, incremental_results_csv,
                                   full_retrain_training_json, full_retrain_results_csv,
                                   out: Path = None, latex: Path = None, plot: Path = None) -> pd.DataFrame:
-    """
-    3-way energy comparison for run_incremental_lightgcn.py's hybrid
-    strategies only — no content mechanism required (e.g. the MovieLens
-    no_update/incremental/full_retrain comparison). full_retrain here is
-    read from its legacy training-only JSON + results CSV (predates this
-    session's section-breakdown tracking), so most of its sections are NaN.
 
-    Outputs: prints table; saves to `out`/`latex`/`plot` if given.
-    """
     print(f"no_update:    {no_update_csv} / {no_update_results_csv}")
     print(f"incremental:  {incremental_csv} / {incremental_results_csv}")
     print(f"full_retrain: {full_retrain_training_json} / {full_retrain_results_csv}\n")
@@ -754,9 +576,7 @@ def _energy_summary_columns(no_update_csv, no_update_results_csv,
                             incremental_csv, incremental_results_csv,
                             content_coldstart_csv, content_coldstart_results_csv,
                             content_incremental_csv, content_incremental_results_csv) -> dict:
-    """One section dict per run — shared by compare_energy_summary and
-    compare_energy_summary_compact so both read the source files exactly
-    the same way."""
+
     print(f"no_update:           {no_update_csv} / {no_update_results_csv}")
     print(f"incremental:         {incremental_csv} / {incremental_results_csv}")
     print(f"content_coldstart:   {content_coldstart_csv} / {content_coldstart_results_csv}")
@@ -775,21 +595,7 @@ def compare_energy_summary(no_update_csv, no_update_results_csv,
                            content_coldstart_csv, content_coldstart_results_csv,
                            content_incremental_csv, content_incremental_results_csv,
                            out: Path = None, latex: Path = None, plot: Path = None) -> pd.DataFrame:
-    """
-    One energy/emissions column per run — no_update/incremental read from a
-    run_incremental_lightgcn.py "*_hybrid_emissions_summary" CSV,
-    content_coldstart/content_incremental from their own "*_energy.csv" —
-    normalized into one common section schema. `*_results_csv` args are
-    each run's per-batch results CSV, needed for the batch-loop sub-task
-    breakdown (only lives per-batch, summed here). Rows = sections,
-    columns = runs. See compare_energy_summary_compact for a shorter,
-    thesis-table-sized version.
 
-    `plot`, if given, saves a stacked-bar-chart PNG via
-    plot_utils.plot_energy_summary_stacked.
-
-    Outputs: prints table; saves to `out`/`latex`/`plot` if given.
-    """
     columns = _energy_summary_columns(no_update_csv, no_update_results_csv,
                                       incremental_csv, incremental_results_csv,
                                       content_coldstart_csv, content_coldstart_results_csv,
@@ -823,13 +629,7 @@ def compare_energy_summary_compact(no_update_csv, no_update_results_csv,
                                    content_coldstart_csv, content_coldstart_results_csv,
                                    content_incremental_csv, content_incremental_results_csv,
                                    out: Path = None, latex: Path = None) -> pd.DataFrame:
-    """
-    Compact, thesis-table-sized energy summary — one row per run, four
-    columns: streaming, content_init (content_build + recovered_history_seed
-    + apply_content_seeds), update_total, expand_embeddings.
-
-    Outputs: prints table; saves to `out`/`latex` if given.
-    """
+ 
     columns = _energy_summary_columns(no_update_csv, no_update_results_csv,
                                       incremental_csv, incremental_results_csv,
                                       content_coldstart_csv, content_coldstart_results_csv,

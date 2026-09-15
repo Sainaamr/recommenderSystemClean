@@ -2,24 +2,15 @@
 """
 Incremental LightGCN streaming experiment.
 
-Supports both ml-1m and yelp datasets via --dataset argument.
-
-Step 1: Train LightGCN on historical split (skip if checkpoint exists)
-Step 2: Stream realtime split in batches of 1000 interactions
-Step 3: Every 20 batches, run incremental_update() on accumulated interactions
-Step 4: Compare two strategies:
-          - no_update:    model never updates → quality degrades over time
-          - incremental:  model updates every 20 batches → quality stays stable
-Step 5: Save Recall@10 and energy per batch to results/{dataset}_hybrid_results.csv
-Step 6: Plot quality degradation vs recovery curve
-
 Usage:
   python experiments/run_incremental_lightgcn.py --dataset ml-1m
   python experiments/run_incremental_lightgcn.py --dataset yelp
 
-Outputs (timestamped to avoid overwriting previous runs):
-  results/ml1m_hybrid_results_YYYYMMDD_HHMMSS.csv
-  results/ml1m_hybrid_curves_YYYYMMDD_HHMMSS.png
+Outputs:
+{prefix} is the dataset 
+{ts} is YYYYMMDD_HHMMSS:
+  {prefix}_hybrid_results_{strategy}_{ts}.csv    
+  {prefix}_hybrid_emissions_summary_{ts}.csv     
 """
 
 import os, sys, glob, argparse, json
@@ -44,17 +35,15 @@ from recbole.data import create_dataset
 from src.models.incremental_lightgcn import IncrementalLightGCN
 from src.evaluation.metrics import batch_metrics_lgcn
 
-# ── Parameters ───────────────────────────────────────────────────────────────
+# Parameters
 BATCH_SIZE    = 1000
-UPDATE_EVERY  = 20    # run incremental_update every N batches
-UPDATE_EPOCHS = 30    # fixed gradient steps per incremental update, no early stopping
+UPDATE_EVERY  = 20   
+UPDATE_EPOCHS = 30   
 RESULTS_DIR   = Path("results")
-# ─────────────────────────────────────────────────────────────────────────────
 
 
-# ── Dataset configs ───────────────────────────────────────────────────────────
-# Each dataset has different paths, config files, ID types, and output files.
-# ml-1m uses numeric IDs (cast with int), Yelp uses alphanumeric (keep as str).
+#Dataset configs
+
 DATASET_CONFIGS = {
     "ml-1m": {
         "dataset":          "ml-1m-historical",
@@ -72,12 +61,7 @@ DATASET_CONFIGS = {
         "checkpoint":       "saved/compatible/LightGCN-yelp-historical.pth",
         "id_cast":          lambda x: str(x),
     },
-    # Identical to "yelp" except that the realtime stream is ordered by timestamp
-    # instead of by user. Same historical split, same checkpoint — only the order
-    # in which the stream is consumed differs, so results are directly comparable.
-    # Global time cut for MovieLens: everything on or before 2000-12-02 trains,
-    # everything after streams. Unlike the per-user split, where only 12 new users
-    # appear in the whole run, this leaves ~36% of each batch's users untrained.
+
     "ml-1m-timecut": {
         "dataset":          "ml-1m-historical-timecut",
         "historical_path":  "dataset/ml-1m-historical-timecut/ml-1m-historical-timecut.inter",
@@ -86,11 +70,7 @@ DATASET_CONFIGS = {
         "checkpoint":       "saved/compatible/LightGCN-ml1m-historical-timecut.pth",
         "id_cast":          lambda x: str(int(x)),
     },
-    # Global time cut instead of a per-user 80/20 split: everything on or before
-    # 2018-05-22 trains, everything after streams. No training interaction
-    # post-dates any streamed one, so the stream can be read chronologically
-    # without the model having seen the future. Requires its own checkpoint —
-    # the historical set differs from "yelp".
+
     "yelp-timecut": {
         "dataset":          "yelp-historical-timecut",
         "historical_path":  "dataset/yelp-historical-timecut/yelp-historical-timecut.inter",
@@ -99,14 +79,6 @@ DATASET_CONFIGS = {
         "checkpoint":       "saved/compatible/LightGCN-yelp-historical-timecut.pth",
         "id_cast":          lambda x: str(x),
     },
-    # Same historical split and checkpoint as yelp-timecut — only the stream
-    # differs: no minimum-interaction filter, so late/light users survive
-    # instead of being right-censored out (see
-    # tools/split_dataset_timecut_unfiltered.py). Nothing needs retraining.
-    # Intended for run_new_user_analysis.py, to test whether new-user arrivals
-    # are actually constant once the filter is removed. Quality metrics on this
-    # stream are not comparable to the filtered runs: 63% of its users have a
-    # single interaction.
     "yelp-timecut-unfiltered": {
         "dataset":          "yelp-historical-timecut",
         "historical_path":  "dataset/yelp-historical-timecut/yelp-historical-timecut.inter",
@@ -128,27 +100,18 @@ DATASET_CONFIGS = {
 
 
 def task_mg(task_result) -> float:
-    """codecarbon stop_task() result (kg CO2, or None) -> mg CO2eq."""
     return (task_result.emissions if task_result else 0.0) * 1e6
 
 
-# Step 1: Train on historical data
 """
 cfg: dataset configuration
 """
 
 def train_historical(cfg: dict) -> tuple[str, float]:
     """
-    Train LightGCN on historical dataset. Returns (checkpoint_path, training_emissions_mg).
-
-    Training emissions are measured with codecarbon and saved to a sidecar
-    "<checkpoint>.energy.json" file next to the checkpoint, so the one-time
-    training cost survives across runs that later reuse the checkpoint
-    (in that case training_emissions_mg is read back from the sidecar, or
-    0.0 if no sidecar exists — e.g. a checkpoint trained before this was
-    added).
+    Train LightGCN on historical dataset
+    Returns (checkpoint_path, training_emissions_mg)
     """
-    # If a specific checkpoint is configured, use it directly
     if cfg["checkpoint"] and Path(cfg["checkpoint"]).exists():
         print(f"Found existing checkpoint: {cfg['checkpoint']}")
         energy_file = Path(cfg["checkpoint"]).with_suffix(".energy.json")
@@ -172,10 +135,7 @@ def train_historical(cfg: dict) -> tuple[str, float]:
         dataset=cfg["dataset"],
         config_file_list=cfg["config_files"],
     )
-    # tracker.stop() returns CO2 emissions in kg (codecarbon's own
-    # EmissionsTracker.stop() docstring: "return: CO2 emissions in kgs"),
-    # not energy — the *1e6 here converts kg to mg (same multiplication as
-    # before, just correctly labeled now instead of being called "µWh").
+
     kg_co2 = tracker.stop() or 0.0
     training_emissions_mg = kg_co2 * 1e6
     print(f"  Historical training emissions: {training_emissions_mg:.4f} mg CO2eq")
@@ -193,11 +153,6 @@ def train_historical(cfg: dict) -> tuple[str, float]:
 # Step 2: Load model and ID mappings
 
 def load_id_mappings(cfg: dict):
-    """
-    Build the RecBole config/dataset and token→internal_id mappings.
-    Returns (user2id, item2id, config, dataset) — config/dataset are handed
-    to IncrementalLightGCN.from_checkpoint by the caller to build the model.
-    """
     config = Config(
         model="LightGCN",
         dataset=cfg["dataset"],
@@ -225,17 +180,14 @@ def build_user_history(user2id: dict, item2id: dict, cfg: dict) -> dict:
     Build user_internal_id (row number) → set of item_internal_ids (row numbers), from historical data.
     Only keeps users and items that exist in the trained model.
     """
-    # historical_path is produced by tools/split_dataset.py, which already
-    # filters to rating>=3 via RecBole (configs/*.yaml val_interval), so no
-    # re-filtering is needed here.
+
     df = pd.read_csv(cfg["historical_path"], sep="\t")
 
     # turn id raw id into string because mapping table built by load id mappings
     # is based on string
     id_cast = cfg["id_cast"]
 
-    # Vectorized map + groupby instead of iterrows() — ~17x faster at
-    # ml-1m/yelp scale, verified identical output on real data.
+    # Vectorized map + groupby instead of iterrows()
     uid_col = df["user_id:token"].map(lambda x: user2id.get(id_cast(x)))
     iid_col = df["item_id:token"].map(lambda x: item2id.get(id_cast(x)))
     mask = uid_col.notna() & iid_col.notna()
@@ -263,17 +215,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
                   tracker: EmissionsTracker) -> tuple[pd.DataFrame, float]:
     """
     Stream realtime data in batches of BATCH_SIZE.
-    strategy: 'no_update', 'incremental', or 'full_retrain'
-
-    New users and items that appear in the stream but were not in historical
-    training are assigned fresh internal IDs and added to the model on the fly:
-      - incremental:  added to graph + embeddings trained via incremental_update
-      - no_update:    embeddings expanded with mean init (so they can be scored)
-                      but graph and weights never updated
-      - full_retrain: every update_every batches, retrains LightGCN from
-                      scratch  via RecBole
-                      on all historical + realtime interactions consumed so
-                      far — the recall/energy "ceiling" comparison point.
+    strategy: no_update, incremental, or full_retrain
     """
     print(f"\nRunning strategy: {strategy}")
     # get info from config file
@@ -288,16 +230,8 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
     # Deep copy history so strategies don't interfere with each other
     history = {uid: set(items) for uid, items in user_history.items()}
 
-    # Growing ID mappings — new users/items get assigned the next available ID
-    # instead of being dropped, and are mean-initialised by expand_embeddings.
-    # Shared by every strategy so all of them are scored on the same
-    # interactions: dropping unseen IDs for full_retrain only made its metrics
-    # incomparable (on yelp-timecut 41% of stream users are untrained, so it
-    # was being graded on a smaller, easier slice of each batch).
-    # user2id/item2id are mutated in place, and rebound after each full retrain
-    # — the closures read them at call time, so they follow the rebinding; the
-    # counters are reset explicitly in the retrain block.
-    next_user_id = [model.n_users]   # list so it's mutable inside the closure
+
+    next_user_id = [model.n_users]   
     next_item_id = [model.n_items]
 
     def get_or_create_uid(x):
@@ -323,12 +257,11 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
         # hold original index
         # the different between this and iid / uid is that interactions of a user is not in one row rather
-        # is it distrubtuted all over the raw data so inex is jsut the index of the row
+        # is it distrubtuted all over the raw data so inex is just the index of the row
         # of one user and one item interaction
-        # we need this because
         df["orig_idx"] = df.index
 
-        #reset so the holes in index goe away
+        #reset so the holes in index goes away
         df = df.reset_index(drop=True)
         n_batches = len(df) // batch_size
 
@@ -342,9 +275,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         consumed_raw_upto = -1 # mark how far along in realtime data we are
 
     else:
-        # realtime_path is pre-filtered to rating>=3 by tools/split_dataset.py
         df = pd.read_csv(cfg["realtime_path"], sep="\t")
-
         n_batches = len(df) // batch_size
 
         # Buffer to accumulate new interactions since last update
@@ -352,11 +283,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
         buffer_items = []
 
     for i in range(n_batches):
-        # Batch body split into named, back-to-back sub-tasks (no gaps
-        # between stop_task() and the next start_task()), so each phase's
-        # own cost is saved separately in the CSV, and batch_emissions_mg
-        # (their sum) is still the accurate whole-batch total — same
-        # pattern as run_content_coldstart.py / run_content_incremental.py.
+
         tracker.start_task(f"batch_{i}_id_resolution")
 
         batch = df.iloc[i * batch_size: (i + 1) * batch_size].copy()
@@ -371,8 +298,6 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
         tracker.start_task(f"batch_{i}_expand_embeddings")
 
-        # expansion — only grow the table if THIS batch actually
-        # introduced a uid/iid beyond the model's current size
         max_u = max(batch_users, default=0)
         max_i = max(batch_items, default=0)
         if max_u >= model.n_users or max_i >= model.n_items:
@@ -385,7 +310,6 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
 
         tracker.start_task(f"batch_{i}_scoring")
 
-        # Measure metrics before update (reflects current model state, no data leakage)
         if batch_users:
             m = batch_metrics_lgcn(model, batch_users, batch_items, history)
         else:
@@ -405,8 +329,7 @@ def run_streaming(model: IncrementalLightGCN, user2id: dict, item2id: dict,
             buffer_items.extend(batch_items)
             needs_update = (i + 1) % update_every == 0
             if needs_update:
-                # Use all accumulated interactions since last update (not just current batch)
-                # This gives a stronger gradient signal: 20 batches × 1000 = 20,000 interactions
+                # Use all accumulated interactions since last update 
                 new_users = np.array(buffer_users)
                 new_items = np.array(buffer_items)
 
@@ -542,16 +465,12 @@ def main():
     cfg = DATASET_CONFIGS[args.dataset].copy()
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stamp output filenames with a shared timestamp, so runs never overwrite
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     dataset_prefix = args.dataset.replace("-", "")
     print(f"Run timestamp: {ts}")
 
-    # Step 1: Train or load checkpoint
     checkpoint, training_emissions_mg = train_historical(cfg)
 
-    # Step 2: Run each requested strategy, each starting from a fresh copy
-    # of the same historical checkpoint
     dfs = {}
     csv_paths = {}
     streaming_emissions_mg = {}
@@ -594,14 +513,9 @@ def main():
             "total_update_emissions_mg":       df["update_emissions_mg"].sum(),
         }
         section_emissions_mg[strategy] = sections
-        # Whole-run emissions = sum of every separately-measured section —
-        # matches the convention in run_content_coldstart.py /
-        # run_content_incremental.py, so streaming_emissions_mg is directly
-        # comparable across all three scripts.
         streaming_emissions_mg[strategy] = sum(sections.values())
         dfs[strategy] = df
 
-        # Step 3: Save each strategy's results to its own CSV immediately
         strategy_csv = results_dir / f"{dataset_prefix}_hybrid_results_{strategy}_{ts}.csv"
         df.to_csv(strategy_csv, index=False)
         csv_paths[strategy] = strategy_csv

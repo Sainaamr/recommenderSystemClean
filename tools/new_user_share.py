@@ -1,33 +1,11 @@
 """
-How much of the stream comes from users the model never trained on.
-
-run_new_user_analysis.py reports this per batch, but with two different
-definitions of "new" in the same CSV:
-
-  n_new_users                        — a user counts once, in the batch where
-                                       they first appear (first-appearance)
-  n_new_user_interactions            — every event from any never-trained user,
-                                       for the rest of the run (untrained)
-
-Both are useful, but they are not the same population, so pairing one with
-the other overstates how much a "new user" interacts. This script reports
-each definition on its own terms, and adds the whole-stream totals, which
-the per-batch pipeline never writes out.
-
-It also reports how concentrated each new user's activity is: how much of
-it lands in the batch they first appear in, and how many never come back.
-That separates a dataset whose newcomers trickle in from one whose
-newcomers arrive having already rated in bulk (MovieLens elicits ratings
-at signup), which changes what a cold-start remedy can be worth.
-
-The trained set comes from load_id_mappings — the same RecBole filtering the
-checkpoint was trained under — so "new" here means exactly what uid >=
-n_users_trained means inside run_new_user_analysis.py.
-
 Usage:
-    python3 tools/new_user_share.py                          # both time-cut datasets
+    python3 tools/new_user_share.py                          
     python3 tools/new_user_share.py --dataset yelp-timecut
     python3 tools/new_user_share.py --out share.csv --latex share.tex
+
+Flag:
+ --dataset --batch-size  --update-every --out --latex
 """
 
 import argparse
@@ -48,22 +26,12 @@ from experiments.run_incremental_lightgcn import (
     DATASET_CONFIGS, RESULTS_DIR, BATCH_SIZE, UPDATE_EVERY, load_id_mappings,
 )
 
-# The two time-cut splits are the ones every figure in the thesis uses.
 DEFAULT_DATASETS = ["yelp-timecut", "ml-1m-timecut"]
 
 
 def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
                    update_every: int = UPDATE_EVERY) -> pd.DataFrame:
-    """
-    Six rows for one dataset: whole-stream user and interaction shares, then
-    the per-window means under each definition of "new".
 
-    Windows are update_every batches of batch_size interactions, matching the
-    window an incremental update trains on. The final window is short whenever
-    the batch count does not divide evenly, and is kept — dropping it would
-    silently discard the tail of the stream. It moves the first-appearance
-    percentages by roughly a third of a point and the untrained ones not at all.
-    """
     cfg = DATASET_CONFIGS[dataset_key]
     user2id, _, _, _ = load_id_mappings(cfg)
 
@@ -71,25 +39,20 @@ def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
     cast = cfg["id_cast"]
     users = df["user_id:token"].apply(cast)
 
-    # A stream user the mapping has never seen is exactly the user that
-    # run_new_user_analysis.py assigns an id >= n_users_trained.
+
     untrained = ~users.isin(user2id.keys())
 
     n_batches = len(users) // batch_size
     kept = n_batches * batch_size            # trailing partial batch is not streamed
     u, unt = users.iloc[:kept], untrained.iloc[:kept]
 
-    # RecBole reserves index 0 for a [PAD] token that no real user maps to.
+
     n_trained = len(user2id) - 1
     print(f"  Trained users:  {n_trained:,}")
     print(f"  Stream rows:    {len(df):,} ({n_batches} batches of {batch_size}, "
           f"{len(df) - kept} trailing rows unused)")
 
-    # "stat" says how to read n_new/n_total on each row: whole-stream counts,
-    # means across windows, or medians across users. Without it the three
-    # scopes look comparable when they are not, and on the median row the
-    # percentage is the median of each user's own ratio, so it deliberately
-    # does not equal n_new / n_total.
+
     rows = [
         {"scope": "stream", "stat": "count", "definition": "untrained", "unit": "users",
          "n_new": u[unt].nunique(), "n_total": u.nunique()},
@@ -97,11 +60,6 @@ def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
          "n_new": int(unt.sum()), "n_total": len(u)},
     ]
 
-    # Per-window means. seen carries across windows so that first-appearance
-    # counts a returning cold-start user only the first time. First-appearance
-    # interactions are counted a batch at a time, not a window at a time, to
-    # match n_first_time_new_user_interactions: a user who arrives in batch 3
-    # contributes only their batch-3 rows, not the rest of the window's.
     seen, per_window = set(), []
     for start in range(0, kept, update_every * batch_size):
         wu = u.iloc[start:start + update_every * batch_size]
@@ -133,9 +91,7 @@ def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
             rows.append({"scope": "window", "stat": "mean", "definition": definition,
                          "unit": unit, "n_new": w[col].mean(), "n_total": w[total].mean()})
 
-    # How front-loaded a new user's activity is. Per user rather than per
-    # window: at window level the two look proportional on both datasets, and
-    # the difference between them only shows up one user at a time.
+
     per_user = pd.DataFrame({"u": u[unt], "batch": pd.Series(range(kept))[unt.values] // batch_size})
     first_batch = per_user.groupby("u").batch.min()
     total_each = per_user.groupby("u").size()
@@ -157,8 +113,7 @@ def new_user_share(dataset_key: str, batch_size: int = BATCH_SIZE,
     ]
 
     out = pd.DataFrame(rows)
-    # Percentages are per-window then averaged for window rows, so a short
-    # final window does not get weighted by its length.
+
     pct = []
     for r in rows:
         if "pct_override" in r:
